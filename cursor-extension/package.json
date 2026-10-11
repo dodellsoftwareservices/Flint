@@ -1,15 +1,28 @@
 {
   "name": "flint-swarm",
   "displayName": "Flint Swarm",
-  "description": "Point a swarm of free OpenRouter coding models at the code you are working on: parallel answers, a tested task queue, and repeatable harness training.",
-  "version": "0.5.0",
-  "publisher": "devon-odell",
-  "license": "UNLICENSED",
-  "private": true,
+  "description": "Point a swarm of free OpenRouter coding models at the code you are working on: parallel answers, a tested task queue, and repeatable harness training. Drives a local Flint checkout, which the extension can install for you.",
+  "version": "0.6.0",
+  "publisher": "dodellsoftwareservices",
+  "license": "MIT",
   "repository": {
     "type": "git",
     "url": "https://github.com/dodellsoftwareservices/Flint"
   },
+  "homepage": "https://github.com/dodellsoftwareservices/Flint#readme",
+  "bugs": {
+    "url": "https://github.com/dodellsoftwareservices/Flint/issues"
+  },
+  "icon": "media/icon.png",
+  "keywords": [
+    "ai",
+    "agents",
+    "openrouter",
+    "swarm",
+    "free models",
+    "code review",
+    "tests"
+  ],
   "engines": {
     "vscode": "^1.90.0"
   },
@@ -130,6 +143,11 @@
       {
         "command": "flintSwarm.showEvidence",
         "title": "Show What Happened on a Swarm Task",
+        "category": "Flint Swarm"
+      },
+      {
+        "command": "flintSwarm.installFlint",
+        "title": "Install Flint…",
         "category": "Flint Swarm"
       },
       {

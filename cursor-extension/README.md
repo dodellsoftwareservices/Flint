@@ -1,5 +1,23 @@
 # Flint Swarm for Cursor
 
+## Getting started
+
+Flint Swarm is the editor side of [Flint](https://github.com/dodellsoftwareservices/Flint), a
+coding swarm that runs on free OpenRouter models. The extension drives a Flint checkout on your
+machine, so after installing it:
+
+1. Install **Git** and **Python 3** if you don't have them.
+2. Run **Flint Swarm: Install Flint…** from the Command Palette (or click **Install Flint** on
+   the prompt that appears at startup). It clones Flint into `~/Flint` (you can choose another
+   folder) and runs its setup in a terminal.
+3. Paste your [OpenRouter API key](https://openrouter.ai/keys) when asked. Creating one is free,
+   and the key is stored in Cursor's encrypted secret storage.
+
+Already have a Flint checkout? Set **Flint Swarm: Flint Path** to it instead.
+
+Flint runs on macOS, and on Linux and Windows through WSL. Agents' shell commands are sandboxed
+on macOS only; elsewhere they run with your user's permissions. Licensed under MIT.
+
 Point the flint swarm at the code you are working on without leaving the editor. Version 0.5
 adds a Codex-style conversation surface, an inline provider/model picker, responsive queue and
 change views, workspace settings, encrypted key storage, and an in-extension setup guide.
@@ -69,9 +87,10 @@ separate choices in one place:
   each request and totalled in `~/.flint/wallet.json`. Paid answers are labelled **paid** in the
   panel and show what they cost; the question's total appears in its footer.
 
-## Install on a laptop
+## Install from source
 
-You need Cursor, Git, Python 3, and the current Node.js LTS. On Windows, use WSL with Ubuntu for
+To build the extension from a Flint checkout instead of the store, you need Cursor, Git,
+Python 3, and the current Node.js LTS. On Windows, use WSL with Ubuntu for
 the terminal steps. Then run:
 
 ```sh
@@ -81,7 +100,7 @@ cd Flint
 ./cursor-extension/install.sh   # later: re-package and reinstall only the extension
 ```
 
-Run both install commands from the `OpenRouterSwarm` folder. Then fully quit Cursor and open it
+Run both install commands from the `Flint` folder. Then fully quit Cursor and open it
 again. The optional in-app shortcut is **Cmd+Shift+P** on macOS (**Ctrl+Shift+P** on Windows or
 Linux), type **Developer: Reload Window**, and press Enter. The extension talks to `swarm/bridge.py` in
 the checkout it was installed from. To use another checkout, set **Flint Swarm: Flint Path**.

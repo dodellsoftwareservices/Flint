@@ -40,8 +40,57 @@ function expandHome(p) { return p ? p.replace(/^~(?=$|\/)/, os.homedir()) : p; }
 function flintRoot() {
   const candidates = [expandHome((cfg().get('flintPath') || '').trim()), process.env.FLINT_ROOT];
   try { candidates.push(fs.readFileSync(path.join(__dirname, 'flint-root.txt'), 'utf8').trim()); } catch (_) { /* not packaged */ }
-  candidates.push(path.resolve(__dirname, '..'), path.join(os.homedir(), 'Desktop', 'LingAI-Trader'));
+  candidates.push(path.resolve(__dirname, '..'), DEFAULT_INSTALL_DIR);
   return candidates.find((c) => c && fs.existsSync(path.join(c, 'swarm', 'bridge.py'))) || null;
+}
+
+// ---------------------------------------------------------------- installing Flint itself
+
+// An extension installed from a store arrives without the Python harness it drives. This is
+// where "Install Flint…" clones it, and where flintRoot() looks when nothing else is set.
+const FLINT_REPO = 'https://github.com/dodellsoftwareservices/Flint.git';
+const DEFAULT_INSTALL_DIR = path.join(os.homedir(), 'Flint');
+
+/** The shell line that clones Flint into `dir` and sets it up, quoted for a POSIX shell.
+ *  --no-extension: the extension is already installed; setup must not replace it with a
+ *  local build. setup.sh asks for the OpenRouter key itself, in the terminal. */
+function installCommand(dir) {
+  const q = (s) => `'${String(s).replace(/'/g, "'\\''")}'`;
+  return `git clone ${FLINT_REPO} ${q(dir)} && cd ${q(dir)} && ./setup.sh --no-extension`;
+}
+
+async function installFlint() {
+  if (process.platform === 'win32') {
+    vscode.window.showErrorMessage('Flint runs inside WSL on Windows: open an Ubuntu (WSL) window '
+      + 'in Cursor and run "Install Flint" there, or follow the setup guide.');
+    return vscode.commands.executeCommand('flintSwarm.showHelp');
+  }
+  const answer = await vscode.window.showInputBox({
+    title: 'Install Flint',
+    prompt: 'Folder to clone Flint into (it needs Git and Python 3)',
+    value: flintRoot() || DEFAULT_INSTALL_DIR,
+    validateInput: (v) => (v && v.trim() ? null : 'Choose a folder'),
+  });
+  if (!answer) return undefined;
+  const target = path.resolve(expandHome(answer.trim()));
+  const useIt = () => cfg().update('flintPath', target, vscode.ConfigurationTarget.Global);
+  if (fs.existsSync(path.join(target, 'swarm', 'bridge.py'))) {
+    await useIt();
+    vscode.window.showInformationMessage(`Flint Swarm will use the Flint checkout in ${target}.`);
+    return target;
+  }
+  if (fs.existsSync(target) && fs.readdirSync(target).length) {
+    vscode.window.showErrorMessage(`${target} already has files in it and is not a Flint checkout. `
+      + 'Choose an empty or new folder.');
+    return undefined;
+  }
+  await useIt();
+  const term = vscode.window.createTerminal({ name: 'Install Flint', cwd: os.homedir() });
+  term.show();
+  term.sendText(installCommand(target));
+  vscode.window.showInformationMessage('Installing Flint in the terminal. When it finishes, run '
+    + '"Flint Swarm: Set the OpenRouter API Key…" if you skipped the key there.');
+  return target;
 }
 
 function pythonFor(root) {
@@ -1446,6 +1495,7 @@ function activate(context) {
     await panel.reveal();
     panel.post({ type: 'tab', tab: 'help' });
   });
+  reg('flintSwarm.installFlint', installFlint);
   reg('flintSwarm.showCustomize', async () => {
     await panel.reveal();
     panel.post({ type: 'tab', tab: 'skin' });
@@ -1466,8 +1516,12 @@ function activate(context) {
   pace();
   context.subscriptions.push({ dispose: () => timer && clearInterval(timer.id) });
   if (!flintRoot()) {
-    vscode.window.showWarningMessage('Flint Swarm cannot find your flint checkout. Set "Flint Swarm: Flint Path" in Settings.', 'Open Settings')
-      .then((a) => { if (a) vscode.commands.executeCommand('workbench.action.openSettings', 'flintSwarm.flintPath'); });
+    vscode.window.showWarningMessage('Flint Swarm needs a Flint checkout on this machine. Install one, '
+      + 'or point "Flint Swarm: Flint Path" at the one you have.', 'Install Flint', 'Open Settings')
+      .then((a) => {
+        if (a === 'Install Flint') vscode.commands.executeCommand('flintSwarm.installFlint');
+        else if (a) vscode.commands.executeCommand('workbench.action.openSettings', 'flintSwarm.flintPath');
+      });
   }
 }
 
@@ -1479,4 +1533,5 @@ module.exports = { activate, deactivate,
   _test: { parseLines, innermost, flintRoot, where, bridgeJson, bridgeLast, PRESETS,
     idleFor, supportsSecondarySidebar, showActivity, providerChoices, provState, chosenBackend,
     providerArgs, promptForApiKey, maybePromptForApiKey, updateVersion,
-    updateClicks, installExtensionUpdate, MAX_UPDATE_CLICKS, UPDATE_CLICKS_KEY } };
+    updateClicks, installExtensionUpdate, MAX_UPDATE_CLICKS, UPDATE_CLICKS_KEY,
+    installCommand, installFlint, DEFAULT_INSTALL_DIR } };

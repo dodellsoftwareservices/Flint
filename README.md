@@ -1,4 +1,4 @@
-# OpenRouterSwarm
+# Flint
 
 A multi-model coding swarm that runs on free OpenRouter models and works on a codebase
 until stopped. One daemon per repository, a tested task queue, an adversarial review before
@@ -99,3 +99,7 @@ neither is required to run the swarm.
 - Node.js, only if you want the Cursor extension (`brew install node`)
 - An OpenRouter account ([openrouter.ai](https://openrouter.ai)) — see the $10 note above
 - Cursor or VS Code, only for the extension; the CLI works anywhere
+
+## License
+
+MIT — see [LICENSE](LICENSE).

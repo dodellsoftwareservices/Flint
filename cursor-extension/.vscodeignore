@@ -1,3 +1,4 @@
 test/**
 *.vsix
 install.sh
+publish.sh

@@ -38,8 +38,8 @@ const vscode = {
     createStatusBarItem: () => ({ show() {}, dispose() {} }),
     registerWebviewViewProvider: (id, p) => { providers.push(id); provider = p; return disposable; },
     createTerminal: (opts) => {
-      const term = { ...opts, name: opts.name, pty: opts.pty, out: [], exitStatus: undefined,
-        show() {}, dispose() { this.exitStatus = { code: 0 }; } };
+      const term = { ...opts, name: opts.name, pty: opts.pty, out: [], sent: [], exitStatus: undefined,
+        show() {}, sendText(t) { this.sent.push(t); }, dispose() { this.exitStatus = { code: 0 }; } };
       if (opts.pty) opts.pty.onDidWrite((s) => term.out.push(s));
       terminals.push(term);
       return term;
@@ -662,6 +662,62 @@ test('maybePromptForApiKey skips when a key is already set or backend is local',
   await ext._test.maybePromptForApiKey();
   // No error surfaced means the prompt stayed silent.
   assert.ok(!vscode.__error, String(vscode.__error));
+});
+
+test('the store package is publishable: namespace, MIT license, icon, nothing personal', () => {
+  assert.strictEqual(manifest.publisher, 'dodellsoftwareservices');
+  assert.strictEqual(manifest.license, 'MIT');
+  assert.ok(!manifest.private, 'a private package cannot be published');
+  assert.ok(/MIT License/.test(fs.readFileSync(path.join(EXT, 'LICENSE'), 'utf8')));
+  const png = fs.readFileSync(path.join(EXT, manifest.icon));
+  assert.strictEqual(png.toString('latin1', 1, 4), 'PNG');
+  assert.deepStrictEqual([png.readUInt32BE(16), png.readUInt32BE(20)], [128, 128]);
+  const code = fs.readFileSync(path.join(EXT, 'extension.js'), 'utf8');
+  assert.ok(!/LingAI-Trader|Devon-ODell/.test(code), 'no personal checkout or old account in the code');
+  const ignored = fs.readFileSync(path.join(EXT, '.vscodeignore'), 'utf8');
+  assert.ok(/^publish\.sh$/m.test(ignored) && /^install\.sh$/m.test(ignored));
+});
+
+test('Install Flint clones into a new folder, runs setup in a terminal, and remembers the path', async () => {
+  const os = require('os');
+  const updates = [];
+  const realConfig = vscode.workspace.getConfiguration;
+  vscode.workspace.getConfiguration = () => ({ get: () => '', update: (k, v, t) => { updates.push([k, v, t]); return Promise.resolve(); } });
+  vscode.ConfigurationTarget = { Global: 1 };
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'flint-install-'));
+  try {
+    assert.strictEqual(ext._test.installCommand("/tmp/it's here"),
+      "git clone https://github.com/dodellsoftwareservices/Flint.git '/tmp/it'\\''s here' && "
+      + "cd '/tmp/it'\\''s here' && ./setup.sh --no-extension");
+    const target = path.join(base, 'Flint');
+    vscode.__inputAnswer = target;
+    const before = terminals.length;
+    assert.strictEqual(await ext._test.installFlint(), target);
+    assert.deepStrictEqual(updates.pop(), ['flintPath', target, 1]);
+    const term = terminals[terminals.length - 1];
+    assert.strictEqual(terminals.length, before + 1);
+    assert.strictEqual(term.sent[0], ext._test.installCommand(target));
+    // A folder that already holds other files is refused rather than cloned into.
+    fs.mkdirSync(path.join(base, 'busy'));
+    fs.writeFileSync(path.join(base, 'busy', 'notes.txt'), 'mine');
+    vscode.__inputAnswer = path.join(base, 'busy');
+    vscode.__error = undefined;
+    assert.strictEqual(await ext._test.installFlint(), undefined);
+    assert.ok(/not a Flint checkout/.test(vscode.__error));
+    assert.strictEqual(terminals.length, before + 1);
+    // An existing checkout is adopted, not cloned again.
+    const have = path.join(base, 'have');
+    fs.mkdirSync(path.join(have, 'swarm'), { recursive: true });
+    fs.writeFileSync(path.join(have, 'swarm', 'bridge.py'), '');
+    vscode.__inputAnswer = have;
+    assert.strictEqual(await ext._test.installFlint(), have);
+    assert.deepStrictEqual(updates.pop(), ['flintPath', have, 1]);
+    assert.strictEqual(terminals.length, before + 1);
+  } finally {
+    vscode.workspace.getConfiguration = realConfig;
+    vscode.__inputAnswer = undefined;
+    fs.rmSync(base, { recursive: true, force: true });
+  }
 });
 
 (async () => {
