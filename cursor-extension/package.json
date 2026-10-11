@@ -1,0 +1,279 @@
+{
+  "name": "flint-swarm",
+  "displayName": "Flint Swarm",
+  "description": "Point a swarm of free OpenRouter coding models at the code you are working on: parallel answers, a tested task queue, and repeatable harness training.",
+  "version": "0.5.0",
+  "publisher": "devon-odell",
+  "license": "UNLICENSED",
+  "private": true,
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dodellsoftwareservices/Flint"
+  },
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "AI",
+    "Other"
+  ],
+  "main": "./extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "flintSwarm",
+          "title": "Flint Swarm",
+          "icon": "media/swarm.svg",
+          "when": "flintSwarm:doesNotSupportSecondarySidebar"
+        }
+      ],
+      "secondarySidebar": [
+        {
+          "id": "flintSwarmSecondary",
+          "title": "Flint Swarm",
+          "icon": "media/swarm.svg",
+          "when": "!flintSwarm:doesNotSupportSecondarySidebar"
+        }
+      ]
+    },
+    "views": {
+      "flintSwarm": [
+        {
+          "type": "webview",
+          "id": "flintSwarm.panel",
+          "name": "Swarm",
+          "when": "flintSwarm:doesNotSupportSecondarySidebar"
+        }
+      ],
+      "flintSwarmSecondary": [
+        {
+          "type": "webview",
+          "id": "flintSwarm.panelSecondary",
+          "name": "Swarm",
+          "when": "!flintSwarm:doesNotSupportSecondarySidebar"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "flintSwarm.askSelection",
+        "title": "Ask the Swarm About This Code",
+        "category": "Flint Swarm"
+      },
+      {
+        "command": "flintSwarm.queueTask",
+        "title": "Queue a Swarm Task for This Code",
+        "category": "Flint Swarm"
+      },
+      {
+        "command": "flintSwarm.startGrind",
+        "title": "Start the Swarm on This Repository",
+        "category": "Flint Swarm"
+      },
+      {
+        "command": "flintSwarm.stopGrind",
+        "title": "Stop the Swarm",
+        "category": "Flint Swarm"
+      },
+      {
+        "command": "flintSwarm.showPanel",
+        "title": "Open the Swarm Panel",
+        "category": "Flint Swarm"
+      },
+      {
+        "command": "flintSwarm.showActivity",
+        "title": "Watch the Swarm's Activity Log",
+        "category": "Flint Swarm",
+        "icon": "$(pulse)"
+      },
+      {
+        "command": "flintSwarm.showReport",
+        "title": "Show Swarm Report",
+        "category": "Flint Swarm"
+      },
+      {
+        "command": "flintSwarm.showQueue",
+        "title": "Show the Swarm Queue",
+        "category": "Flint Swarm",
+        "icon": "$(list-unordered)"
+      },
+      {
+        "command": "flintSwarm.clearQueue",
+        "title": "Clear the Swarm Queue",
+        "category": "Flint Swarm"
+      },
+      {
+        "command": "flintSwarm.setBudget",
+        "title": "Set the Paid Model Budget",
+        "category": "Flint Swarm"
+      },
+      {
+        "command": "flintSwarm.refresh",
+        "title": "Refresh Swarm Status",
+        "category": "Flint Swarm",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "flintSwarm.togglePaid",
+        "title": "Set the Paid Answer Policy",
+        "category": "Flint Swarm"
+      },
+      {
+        "command": "flintSwarm.setQuotaMode",
+        "title": "Set What Happens When the Free Allowance Runs Out",
+        "category": "Flint Swarm"
+      },
+      {
+        "command": "flintSwarm.showEvidence",
+        "title": "Show What Happened on a Swarm Task",
+        "category": "Flint Swarm"
+      },
+      {
+        "command": "flintSwarm.setApiKey",
+        "title": "Set the OpenRouter API Key…",
+        "category": "Flint Swarm"
+      },
+      {
+        "command": "flintSwarm.showSettings",
+        "title": "Open Flint Swarm Settings",
+        "category": "Flint Swarm",
+        "icon": "$(gear)"
+      },
+      {
+        "command": "flintSwarm.showHelp",
+        "title": "Open Flint Swarm Setup Guide",
+        "category": "Flint Swarm",
+        "icon": "$(question)"
+      },
+      {
+        "command": "flintSwarm.showCustomize",
+        "title": "Customize Flint Swarm's Look",
+        "category": "Flint Swarm",
+        "icon": "$(paintcan)"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "flintSwarm.askSelection",
+          "group": "flintSwarm@1"
+        },
+        {
+          "command": "flintSwarm.queueTask",
+          "group": "flintSwarm@2"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "flintSwarm.showActivity",
+          "when": "view == flintSwarm.panel || view == flintSwarm.panelSecondary",
+          "group": "navigation@0"
+        },
+        {
+          "command": "flintSwarm.showQueue",
+          "when": "view == flintSwarm.panel || view == flintSwarm.panelSecondary",
+          "group": "navigation@1"
+        },
+        {
+          "command": "flintSwarm.refresh",
+          "when": "view == flintSwarm.panel || view == flintSwarm.panelSecondary",
+          "group": "navigation@2"
+        },
+        {
+          "command": "flintSwarm.showSettings",
+          "when": "view == flintSwarm.panel || view == flintSwarm.panelSecondary",
+          "group": "navigation@3"
+        },
+        {
+          "command": "flintSwarm.showHelp",
+          "when": "view == flintSwarm.panel || view == flintSwarm.panelSecondary",
+          "group": "navigation@4"
+        },
+        {
+          "command": "flintSwarm.showCustomize",
+          "when": "view == flintSwarm.panel || view == flintSwarm.panelSecondary",
+          "group": "navigation@5"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "flintSwarm.askSelection",
+        "key": "ctrl+alt+a",
+        "mac": "ctrl+alt+a",
+        "when": "editorTextFocus"
+      }
+    ],
+    "configuration": {
+      "title": "Flint Swarm",
+      "properties": {
+        "flintSwarm.flintPath": {
+          "type": "string",
+          "default": "",
+          "description": "Folder that contains flint.py and swarm/. Leave empty to use the folder recorded when this extension was installed."
+        },
+        "flintSwarm.python": {
+          "type": "string",
+          "default": "",
+          "description": "Python interpreter for the swarm. Leave empty to use <flintPath>/.venv/bin/python."
+        },
+        "flintSwarm.models": {
+          "type": "number",
+          "default": 3,
+          "minimum": 1,
+          "maximum": 6,
+          "description": "How many free models answer each question in parallel. Each model spends up to 'stepsPerModel' free requests."
+        },
+        "flintSwarm.stepsPerModel": {
+          "type": "number",
+          "default": 8,
+          "minimum": 2,
+          "maximum": 20,
+          "description": "Tool rounds (requests) each answering model may use to read your code and the MIT corpus."
+        },
+        "flintSwarm.synthesize": {
+          "type": "boolean",
+          "default": true,
+          "description": "Have one more model check the answers against the code and merge them."
+        },
+        "flintSwarm.useStudy": {
+          "type": "boolean",
+          "default": true,
+          "description": "Let answering models search the MIT OpenCourseWare corpus with the study tool."
+        },
+        "flintSwarm.timeoutSeconds": {
+          "type": "number",
+          "default": 300,
+          "minimum": 60,
+          "maximum": 1800,
+          "description": "Seconds a single model may take before it is given up on. Free models are slow; raise this if good answers are being cut off."
+        },
+        "flintSwarm.paidFallback": {
+          "type": "string",
+          "enum": [
+            "off",
+            "auto",
+            "always"
+          ],
+          "enumDescriptions": [
+            "Free models only. A question with no free answer comes back empty.",
+            "Spend from the paid budget only when no free model answered.",
+            "Answer with paid models from the start. Fastest and most reliable; spends the budget quickest."
+          ],
+          "default": "off",
+          "description": "Whether a question may fall back to a paid model, spending from the budget set with \"Flint Swarm: Set the Paid Model Budget\" (default $5 in total). Free-only by default: turn it on deliberately in the panel's Cost & fallback settings."
+        },
+        "flintSwarm.providerState": {
+          "type": "object",
+          "default": {},
+          "scope": "window",
+          "description": "The backend and model the last ask used (openrouter, ollama, lm-studio, mlx, llamacpp, or a custom endpoint URL). Set automatically by the picker; edit only to reset it."
+        }
+      }
+    }
+  }
+}

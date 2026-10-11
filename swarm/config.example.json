@@ -1,0 +1,93 @@
+{
+  "_comment": "Template. `swarm grind /path/to/repo` copies this to config.json and fills in repo/test_cmd/python/base_branch. Edit config.json, not this file.",
+  "repo": "__REPO__",
+  "base_branch": "main",
+  "trunk": "swarm/trunk",
+  "goal_file": "GOAL.md",
+  "test_cmd": "__TEST_CMD__",
+  "python": "__PYTHON__",
+  "models": [
+    "qwen/qwen3.8-27b:free",
+    "nex-agi/nex-n2.5-pro:free",
+    "dots-studio/dots-3-note-preview:free",
+    "nvidia/nemotron-3-super-120b-a12b:free",
+    "nvidia/nemotron-3-ultra-550b-a55b:free",
+    "poolside/laguna-s-2.1:free",
+    "cohere/north-mini-code:free"
+  ],
+  "allow_paid": false,
+  "editor_wallet": {
+    "_comment": "Dollars the Cursor/VS Code extension may spend on paid models when no free model answers a question. The swarm daemon never touches this: it is free-models-only unless allow_paid is set. Spending is recorded in ~/.flint/wallet.json and checked before every request.",
+    "enabled": true,
+    "cap_usd": 5.0,
+    "paid_models": [
+      "anthropic/claude-haiku-4.5",
+      "google/gemini-2.5-flash",
+      "openai/gpt-5-mini",
+      "deepseek/deepseek-chat",
+      "qwen/qwen3-coder"
+    ]
+  },
+  "workers": 1,
+  "daily_cap": 800,
+  "reserve": 200,
+  "task_request_cap": 45,
+  "run_request_cap": 300,
+  "max_role_calls": 5,
+  "owner_window": [
+    "00:00",
+    "00:00"
+  ],
+  "steps": {
+    "planner": 6,
+    "architect": 0,
+    "implementer": 10,
+    "adversary": 5,
+    "judge": 0,
+    "decomposer": 5,
+    "repair": 8
+  },
+  "max_repairs": 1,
+  "max_depth": 1,
+  "max_queue": 20,
+  "sandbox": true,
+  "sandbox_write": [],
+  "keep_worktrees": false,
+  "notify": true,
+  "corpus_db": "~/.flint/corpus.db",
+  "corpus_k": 4,
+  "mit_experiment": {
+    "enabled": true,
+    "share_on": 0.5
+  },
+  "inject_corpus": true,
+  "tick": 90,
+  "shutdown_on_quota_exhausted": "shutdown",
+  "restart_on_change": true,
+  "restart_min_interval": 300,
+  "allowance_recheck": 300,
+  "plan_batch": 5,
+  "plan_cooldown": 600,
+  "scope_gate": true,
+  "idle_improvement": true,
+  "idle_improvement_cooldown": 1800,
+  "max_review_formats": 2,
+  "turn_timeout": 1800,
+  "test_timeout": 900,
+  "max_diff": 24000,
+  "role_timeouts": {
+    "implementer": 900,
+    "repair": 900,
+    "architect": 300,
+    "planner": 300,
+    "adversary": 300,
+    "judge": 300,
+    "decomposer": 300
+  },
+  "prov": {
+    "_comment": "Provisioning hooks the swarm runs in each fresh worktree before the test gate, so a bare checkout (fresh codespace, new laptop) reaches green without hand setup. Hooks run unsandboxed (they must install deps) but only in temp + package-cache writable dirs. `swarm init <repo>` writes configs/<slug>.json with a prov block filling in any of these that apply. Each hook runs exactly once per worktree, in list order; a failing hook fails the attempt with its output.",
+    "hooks": [],
+    "env": {},
+    "timeout": 1200
+  }
+}

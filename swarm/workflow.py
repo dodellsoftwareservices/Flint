@@ -1,0 +1,369 @@
+"""Contracts, review validation and durable evidence for recursive swarm work.
+
+Model observations are recorded as claims. Test exits and Git tree/commit IDs
+are recorded by the supervisor. Neither a review nor a reward proves correctness.
+"""
+import hashlib
+import json
+from pathlib import Path
+import re
+import time
+
+try:  # package import in tests; top-level import when swarmd.py is executed directly
+    from .task_rules import SIGNAL_LINE
+except ImportError:  # pragma: no cover - script mode
+    from task_rules import SIGNAL_LINE
+
+
+STRATEGIES = {
+    "regression_first": "Reproduce the problem with a focused regression test. Make the smallest fix, then run the complete configured checks.",
+    "small_vertical_slice": "Implement one end-to-end slice of the acceptance criteria, verify it, and keep the diff narrowly scoped.",
+    "invariants_first": "Identify boundary conditions and invariants. Add checks for them before changing the algorithm or data flow.",
+}
+
+
+def criteria(task):
+    rows = task.get("acceptance") or [task.get("detail") or task["title"]]
+    # Work order §10: at most five acceptance criteria — one observable outcome, five
+    # checks at the outside — so a packet stays a single bounded attempt.
+    if not isinstance(rows, list) or not 1 <= len(rows) <= 5:
+        raise ValueError("acceptance must contain 1–5 concrete criteria")
+    if any(not isinstance(row, str) or not row.strip() or len(row) > 2000 for row in rows):
+        raise ValueError("each acceptance criterion must be nonempty text under 2000 characters")
+    return [{"id": f"C{i + 1}", "text": row.strip()} for i, row in enumerate(rows)]
+
+
+def contract(task, goal, base, strategy):
+    return {"task": task["id"], "title": task["title"], "goal": goal,
+            "base_commit": base, "acceptance": criteria(task), "strategy": strategy,
+            "parent": task.get("parent"), "root": task.get("root", task["id"]),
+            "depth": task.get("depth", 0), "depends_on": task.get("depends_on", []),
+            "allowed_paths": task.get("allowed_paths", []),
+            "verification_commands": task.get("verification_commands", [])}
+
+
+def validate_scope(task):
+    """Explicit files, or directories ending in '/', relative to the worktree."""
+    scope = task.get("allowed_paths")
+    if scope is not None:
+        if not isinstance(scope, list) or not scope:
+            raise ValueError("allowed_paths must be a nonempty list")
+        for name in scope:
+            if (not isinstance(name, str) or not name or Path(name).is_absolute()
+                    or any(p in ("..", ".git") for p in Path(name).parts)
+                    or str(Path(name)) == "." or any(c in name for c in "*?[]\\\x00")):
+                raise ValueError("allowed_paths must name repository files or directory/ prefixes")
+    commands = task.get("verification_commands", [])
+    if not isinstance(commands, list) or any(not isinstance(c, str) or not c.strip() for c in commands):
+        raise ValueError("verification_commands must be a list of nonempty commands")
+
+
+def path_allowed(path, scope):
+    return any(path == p or (p.endswith("/") and path.startswith(p)) for p in scope)
+
+
+def salvaged_object(text, start, required="verdict"):
+    """The longest prefix of the object at `start` that parses once its containers are closed.
+
+    A reviewer that closes `"acceptance": [...` with `}` instead of `]`, or simply stops mid
+    reply, produces a review no decoder will read — and the whole verdict is lost along with the
+    candidate it was about. That is a fact about the reviewer, not about the code, and on
+    2026-09-27 it threw away an implementation whose full suite had just passed, because the
+    reviewer pool held one eligible model and no second reviewer could be asked.
+
+    So the reply is cut back to each point where a value had just ended, longest first, the
+    containers still open at that point are closed, and the first candidate that parses into an
+    object with a verdict wins. Cutting can only ever drop trailing content, never invent it, and
+    `parse_review` refuses to let a reply repaired this way carry an approval."""
+    stack, cuts, in_string, escaped = [], [], False, False
+    for i, ch in enumerate(text[start:], start):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+                cuts.append((i + 1, tuple(stack)))
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch in "{[":
+            stack.append("}" if ch == "{" else "]")
+        elif ch in "}]":
+            if not stack or stack[-1] != ch:
+                break              # the reply contradicts its own structure; keep what precedes
+            stack.pop()
+            cuts.append((i + 1, tuple(stack)))
+            if not stack:
+                break
+        elif ch == ",":
+            cuts.append((i, tuple(stack)))   # before the comma, so a bare literal ends cleanly
+    for cut, open_containers in reversed(cuts):
+        if not open_containers:
+            continue               # a complete object here would have decoded already
+        try:
+            value = json.loads(text[start:cut] + "".join(reversed(open_containers)))
+        except ValueError:
+            continue
+        if isinstance(value, dict) and required in value:
+            return value
+    return None
+
+
+def review_object(text):
+    """(review, repaired) — bare JSON, a ```json fence, the object amid prose, or a salvage."""
+    text = (text or "").strip()
+    try:
+        return json.loads(text), False
+    except ValueError:
+        pass
+    decoder = json.JSONDecoder()
+    starts = [match.start() for match in re.finditer(r"\{", text)]
+    for start in starts:
+        try:
+            value, _ = decoder.raw_decode(text, start)
+        except ValueError:
+            continue
+        if isinstance(value, dict) and "verdict" in value:
+            return value, False
+    for start in starts:
+        value = salvaged_object(text, start)
+        if value is not None:
+            return value, True
+    raise ValueError("no JSON object with a verdict")
+
+
+# Severities reviewers use for remarks that are not defects.
+OBSERVATION = frozenset({"info", "information", "note", "nit", "nitpick", "suggestion",
+                         "observation", "praise", "none", "low"})
+
+
+def parse_review(text, tree, acceptance):
+    """A malformed, stale or unsupported approval is never usable.
+
+    Formatting slips are forgiven (fences, prose around the object, "APPROVE" casing, a line
+    number as a string, an abbreviated or omitted tree): the supervisor names the tree it asked
+    about and verifies afterwards that the reviewer did not change it. A different tree is not."""
+    try:
+        review, repaired = review_object(text)
+    except (ValueError, TypeError) as exc:
+        raise ValueError("review must be a JSON object with a verdict") from exc
+    if isinstance(review, dict) and isinstance(review.get("verdict"), str):
+        review["verdict"] = review["verdict"].strip().lower()
+    if repaired and isinstance(review, dict):
+        # Salvage drops trailing content, and the dropped tail could have held the blocker that
+        # made the verdict wrong. Every other check below still has to pass on what survived.
+        if review.get("verdict") == "approve":
+            raise ValueError("a reply damaged this badly may not carry an approval")
+        review["salvaged"] = True
+    if not isinstance(review, dict) or review.get("verdict") not in ("approve", "request_changes"):
+        raise ValueError("review verdict must be approve or request_changes")
+    echoed = review.get("tree")
+    if echoed in (None, ""):
+        review["tree"] = tree
+    elif isinstance(echoed, str) and len(echoed.strip()) >= 7 and tree.startswith(echoed.strip()):
+        review["tree"] = tree
+    else:
+        raise ValueError("review refers to a different Git tree")
+    for row in review.get("checks") or []:
+        if isinstance(row, dict) and isinstance(row.get("passed"), str) and row["passed"].lower() in ("true", "false"):
+            row["passed"] = row["passed"].lower() == "true"
+    for finding in review.get("findings") or []:
+        if isinstance(finding, dict) and isinstance(finding.get("line"), str) and finding["line"].strip().isdigit():
+            finding["line"] = int(finding["line"])
+    if not isinstance(review.get("summary"), str) or not review["summary"].strip():
+        raise ValueError("review needs a summary")
+    checks, findings = review.get("checks"), review.get("findings")
+    if not isinstance(checks, list) or not isinstance(findings, list):
+        raise ValueError("review needs checks and findings lists")
+    expected = {row["id"] for row in acceptance}
+    if len(checks) != len(expected):
+        raise ValueError("review must check every acceptance criterion once")
+    seen = set()
+    for row in checks:
+        if (not isinstance(row, dict) or row.get("criterion") not in expected
+                or row["criterion"] in seen or type(row.get("passed")) is not bool
+                or not isinstance(row.get("evidence"), str) or not row["evidence"].strip()):
+            raise ValueError("invalid, duplicate or unevidenced acceptance check")
+        seen.add(row["criterion"])
+    for finding in findings:
+        if isinstance(finding, dict) and str(finding.get("severity", "")).lower() in OBSERVATION:
+            # An observation, not a defect. The first SkyRing review filed one as "info" with
+            # no verification, and the whole verdict was rejected for it (5 requests, 39 s).
+            # Filed as minor it cannot block, and the acceptance-gap check below still reads it.
+            finding["severity"] = "minor"
+        if not isinstance(finding, dict) or finding.get("severity") not in ("blocker", "major", "minor"):
+            raise ValueError("each finding needs a severity")
+        # A minor finding blocks nothing, so there is nothing for a verification to prove.
+        for field in ("issue", "verification") if finding["severity"] != "minor" else ("issue",):
+            if not isinstance(finding.get(field), str) or not finding[field].strip():
+                raise ValueError(f"each finding needs {field}")
+        if not isinstance(finding.get("verification"), str):
+            finding["verification"] = ""
+        # A real defect is not always one file and line — "no corpus audit was done
+        # before this check went live" has nothing to point a line number at. path and
+        # line are required together, as a pair, or omitted together; a finding is never
+        # rejected just for being about the change as a whole rather than one spot in it.
+        path_val, line_val = finding.get("path"), finding.get("line")
+        if path_val or line_val:
+            if not isinstance(path_val, str) or not path_val.strip():
+                raise ValueError("a finding with a line needs a path")
+            path = Path(path_val)
+            if path.is_absolute() or ".." in path.parts:
+                raise ValueError("finding paths must stay relative to the repository")
+            if type(line_val) is not int or line_val < 1:
+                raise ValueError("finding line must be a positive integer")
+    blockers = any(f["severity"] in ("blocker", "major") for f in findings)
+    acceptance_gap = any(
+        "acceptance criter" in f["issue"].lower()
+        and any(word in f["issue"].lower()
+                for word in ("missing", "unmet", "not ", "no ", "doesn't", "does not"))
+        for f in findings
+    )
+    if review["verdict"] == "approve" and (blockers or acceptance_gap or any(not row["passed"] for row in checks)):
+        raise ValueError("approval contradicts its findings or acceptance checks")
+    if review["verdict"] == "request_changes" and not findings and all(row["passed"] for row in checks):
+        raise ValueError("request_changes must identify a finding or failed criterion")
+    return review
+
+
+def failure_lines(details):
+    """The lines of a failure that say what failed, with directories cut to file names."""
+    lines = [l.strip() for l in re.split(r"\n|\\n", str(details or ""))
+             if SIGNAL_LINE.search(l) and not l.strip().startswith(("PASS", '"log"'))]
+    # The gate's own bookkeeping (which log, how long) changes every cycle; so do directories.
+    lines = [re.sub(r'"(?:log|seconds)":\s*(?:"[^"]*"|[\d.]+),?\s*', "", l) for l in lines]
+    return [re.sub(r"(?:/[^\s/'\"]+)+/", "/", l) for l in lines]
+
+
+def failure_signature(stage, details):
+    """Stable enough to detect repeating the same failed approach after a repair.
+
+    It hashed the whole gate evidence, which names the cycle's log file, its timing and the
+    temp directory the gate built in, so no two failures ever matched: the SkyRing stamina
+    packet failed three times on the same `44 == 36` and was repaired twice regardless."""
+    # A review's findings are its substance, so only a gate failure is reduced to its lines.
+    lines = failure_lines(details) if stage == "tests_failed" else []
+    text = "\n".join(lines) if lines else str(details or "")
+    text = re.sub(r"\b[0-9a-f]{7,40}\b|\b\d+(?:\.\d+)?s\b", "<value>", text.lower())
+    return hashlib.sha256(f"{stage}:{text}".encode()).hexdigest()[:16]
+
+
+def out_of_scope_check(details, scope, grep):
+    """`path:line` of the check a failure comes from (up to three), when every copy of it
+    lives outside `scope`.
+
+    A failure that survives a repair and whose check sits in a file the packet may not touch
+    is the packet's defect, not the model's: the stamina packet appended ErWorld fields that
+    plugin/src/Bridge.cpp and tools/verify.py pin at 36 bytes, and allowed_paths had neither.
+    `grep(text)` returns `path:line` hits for a fixed string in the worktree."""
+    if not scope:
+        return ""
+    # Only a compiler's diagnostic counts: it echoes the failing source line under
+    # `file:line:col: error:`, and code outside the packet that no longer compiles has to change.
+    # A test's assertion is not enough. A test outside the packet that fails on a quoted value
+    # is usually the in-scope code being wrong, which is the model's to fix.
+    lines = [l.strip() for l in re.split(r"\n|\\n", str(details or ""))]
+    snippets = [code for diag, code in zip(lines, lines[1:])
+                if re.search(r":\d+(?::\d+)?: (?:fatal )?error\b", diag)
+                and len(code) >= 8 and not code.startswith(("^", "~", "|"))]
+    for snippet in dict.fromkeys(snippets):
+        hits = [h for h in grep(snippet) if h]
+        files = {h.split(":", 1)[0] for h in hits}
+        if hits and not any(path_allowed(f, scope) for f in files):
+            return ", ".join(hits[:3])
+    return ""
+
+
+class Attempt:
+    """Single-writer artifact bundle. It survives worktree cleanup and restarts."""
+    def __init__(self, root, name, task, worktree, branch):
+        self.path = Path(root) / "attempts" / name
+        self.path.mkdir(parents=True, exist_ok=True)
+        self.data = {"schema": 1, "id": name, "task": task, "worktree": str(worktree),
+                     "branch": branch, "started": time.time(), "phase": "created",
+                     "role_calls": 0, "repairs": 0, "events": []}
+        self.record("created")
+
+    def write(self, name, value):
+        path = self.path / name
+        temp = path.with_suffix(path.suffix + ".tmp")
+        temp.write_text(value if isinstance(value, str) else json.dumps(value, indent=2))
+        temp.replace(path)
+        return str(path)
+
+    def record(self, phase, **data):
+        event = {"time": time.time(), "phase": phase, **data}
+        self.data.update(data, phase=phase)
+        self.data["events"].append(event)
+        self.write("attempt.json", self.data)
+
+    def finish(self, stage, note):
+        self.record(stage, note=note, finished=time.time(),
+                    seconds=round(time.time() - self.data["started"], 3))
+        task = self.data["task"]
+        self.write("HANDOFF.md", "\n".join([
+            f"# {task['title']}", "", f"Outcome: {stage}",
+            f"Branch: {self.data['branch']}", f"Worktree: {self.data['worktree']}",
+            f"Commit: {self.data.get('commit', '(not integrated)')}",
+            f"Strategy: {self.data.get('strategy', 'none')}",
+            f"Role calls: {self.data['role_calls']}; repairs: {self.data['repairs']}",
+            "", "## Result / next action", "", note,
+            "", "## Evidence", "", "See attempt.json, contract.json, review-*.json, and gate-*.log.",
+            "Reviewer observations are claims; gate logs and Git IDs are supervisor observations.",
+        ]) + "\n")
+
+
+REVIEW = """You are an independent reviewer. Inspect files; do not modify them.
+Assess the change against the contract and the actual evidence. Read full
+files when the diff is truncated. Do not approve solely because the checks passed.
+The artifact may be code, writing, translation, data or research: judge it against
+what the task asked for, whatever kind of artifact that is, with concrete findings.
+Find concrete defects and explain how the implementer can reproduce each one.
+
+CONTRACT
+{contract}
+
+GIT TREE TO REVIEW: {tree}
+
+SUPERVISOR TEST EVIDENCE
+{tests}
+
+DIFF
+{diff}
+
+Output ONLY a JSON object with this exact structure. Include one check per
+criterion ID, naming the relevant test/file and reasoning in evidence. Do not
+claim you ran commands; the supplied gate records say what actually ran.
+{{"verdict":"approve|request_changes", "tree":"{tree}", "summary":"...",
+"checks":[{{"criterion":"C1","passed":true,"evidence":"..."}}],
+"findings":[{{"severity":"blocker|major|minor","path":"relative/file.py",
+"line":1,"issue":"concrete defect","verification":"input/test and expected result"}}],
+"lesson":"optional, specific advice supported by this change",
+"follow_ups":[{{"title":"...","detail":"why this advances the same goal",
+"acceptance":["concrete check"]}}]}}
+Only defects go in findings: leave observations, praise and ideas out of it.
+Use an empty findings list when there are none. Blockers/major findings or failed
+criteria require request_changes. Suggestions for future features are not blockers.
+"""
+
+
+REPAIR = """Continue the existing implementation in this worktree; preserve prior work.
+Fix the observed failures below. Add a regression test for each actual defect,
+then run the configured checks. Do not weaken tests or commit/switch/reset Git.
+If this failure repeats, change your approach based on evidence.
+
+CONTRACT
+{contract}
+
+{context}
+
+FAILURE / REVIEW HANDOFF
+{failure}
+
+VERIFICATION COMMAND: {test_cmd}
+
+Finish with changes made, commands/results and remaining issues. Stay within
+the original acceptance criteria; do not expand the task to fill the budget.
+"""

@@ -1,0 +1,483 @@
+# Flint swarm
+
+A multi-model coding swarm on free OpenRouter models that works on a codebase
+until you stop it, compounds its own accepted work, and learns which agents and
+ideas to reinforce.
+
+First time in a checkout (creates `.venv`, finds or asks for your OpenRouter
+key, installs the `flint` and `swarm` commands, runs the tests and installs the
+Cursor extension pointed at this folder):
+
+```sh
+./setup.sh
+```
+
+`swarm/config.json` is yours: it is created from `swarm/config.example.json`
+on first use, rewritten on every run, and not tracked by Git, so pulling never
+fights with it. Delete it to start again from the template.
+
+A repository with settings worth keeping gets its own file:
+`swarm/configs/<slug>.json`, where the slug is the one its state and logs use
+(`swarm/state/<slug>/`) — `swarm status` prints it as `config_path`. Whenever a
+repository is named, that file is loaded in place of `config.json`, so `swarm
+grind <repo>`, the bridge, the Cursor panel's Start button and its status view
+all agree about which test command, model pool and cooldowns are in effect.
+`FLINT_SWARM_CONFIG` overrides both. When a tuned file exists but something
+else was loaded, the daemon logs a warning and journals `config_mismatch`
+rather than grinding quietly on the wrong settings.
+
+```sh
+swarm grind ~/code/project --goal "what it should become"   # start nonstop
+swarm grind                                                 # resume the configured target
+swarm grind --new ~/code/idea --goal "a problem with no code yet"
+swarm report                                                # in the morning
+```
+
+`flint /nonstop` / `flint --nonstop` is the separate single-agent mode that
+edits the current directory directly. The swarm never edits your checkout.
+
+## One task, end to end
+
+1. **Claim** the highest-priority ready task (breakthrough follow-ups, then
+   splits of failed tasks, then planned or hand-added work).
+2. **Branch** a fresh worktree from `swarm/trunk`, which already holds every
+   change the swarm has accepted, so later work builds on earlier work.
+3. **Implement** with a model drawn by Thompson sampling. The prompt carries
+   the goal, the task, earlier failure notes, the playbook of lessons and
+   pitfalls, and a **context pack**: the files the task names (or the task it
+   was split out of names), already read, numbered exactly as `read_file`
+   prints them so an `edit_file` `old_str` can be copied straight out. A file
+   too long to show becomes an outline of its definitions with line numbers.
+   The turn's rounds are for editing, not for finding the file. The contract and
+   its acceptance criteria come last, which is the text a model attends to most.
+   On the corpus side of the MIT experiment (below) the prompt also carries MIT
+   lecture-card excerpts — but only when a card matches at least two distinct
+   words of the task, and then only that lecture's own pages, never a
+   transcript. `inject_corpus: false` keeps excerpts out of a repository's
+   prompts altogether; either way every role can still call the `study` tool.
+4. **Gate**: the test command must pass, and no existing assertion may be lost.
+   Trunk's own baseline run is cached per commit and per command set (24 hours
+   by default, `baseline_ttl`), so an unchanged trunk is not re-proved before
+   every attempt; the implementer is asked to run the narrowest covering module
+   while it works, and the supervisor runs the whole command afterwards.
+   Lost, not touched: an assertion removed and the same assertion function added
+   back in the same hunk is an edit, assertions removed alongside the code they
+   tested go with it, and a test file deleted with its subject is one removal.
+   A task may be allowed to change tests outright — `swarm add
+   --allow-test-changes`, or the panel's edit form — which only a person can
+   set, and which the adversary is told about.
+5. **Adversary**: a different model tries to break the change and must end
+   with exactly `APPROVE: …`. A rejection leaves its failing test on the branch.
+6. **Land** on trunk by fast-forward, rebasing and re-testing first if trunk
+   moved. Trunk is never moved while it is checked out anywhere.
+7. **Judge**: a third model scores impact, creativity and quality (0–10),
+   names one lesson and up to two follow-ups. If the goal ranks its work under a
+   heading saying `Work on now` or `Priorities`, the judge is shown that list and
+   says which item the change served; what the change earned above the landing
+   floor is then scaled by its place in it (1.0, 0.85, 0.6, 0.5, and 0.35 for
+   serving nothing on the list). The planner is held to the same list: a task
+   must say which priority it `serves`, tasks serving none are dropped, and at
+   least half of each batch must serve the first. A goal that ranks nothing
+   leaves all of this switched off.
+8. **Reinforce**: the reward updates the implementer model, the planner model
+   and the planner persona that proposed the task.
+
+Failures retry once with their notes, then the decomposer splits the task into
+2–3 smaller ones (depth 1); if those fail twice they are parked for you.
+
+## Rewards, creativity and breakthroughs
+
+Only work that passed the tests, the reviewer and landing can score above 0.4.
+Each outcome also has a weight: how many draws' worth of evidence it adds to
+the model's record. Punishment outweighs praise.
+
+| outcome | reward | weight |
+|---|---|---|
+| weakened existing tests | 0.00 | 6 |
+| shipped code that fails the tests | 0.00 | 4 |
+| reviewer proved a defect | 0.00 | 4 |
+| no change, malformed output | 0.00 | 2 |
+| accepted but lost a landing race | 0.30 | 0.5 |
+| landed | 0.4 + 0.6 × (0.35 impact + 0.35 creativity + 0.30 quality)/10, − 0.1 per repair round, + up to 0.1 novelty | 2 |
+| breakthrough | an extra 1.0 | +3 |
+
+A model with two good landings that then ships faulty code once drops below
+an untried model and needs three more clean landings to climb back. Only the
+code's author takes the penalty weight; the planner whose idea it was learns
+at normal weight. A reviewer that cannot deliver a verdict is penalised as a
+malformed output.
+
+**The rafters.** Faulty code that never got fixed is hung up under its
+author's name. The reviewer's top finding (or the failing test line) and the
+offending lines of the diff are shown in every later implementer's and
+planner's prompt ("HUNG FROM THE RAFTERS"). Cheating ranks highest, then the
+newest; the three worst of the last twelve are shown. Every exhibit is also
+appended to `RAFTERS.md` and announced with a notification; the playbook
+section of `swarm report` shows the current wall.
+
+Novelty is the distance from everything accepted before. Creativity counts as
+much as impact, and the planner rotates between five personas: builder,
+**inventor** (ideas nobody asked for), **scholar** (applies a technique from the
+MIT corpus), hardener and refiner. Personas that produce highly scored,
+accepted work get drawn more often.
+
+A **breakthrough** is landed work that the judge flags with impact or creativity
+≥ 8, or a reward at least 0.85 and two standard deviations above recent landed
+work. It is reinforced twice, its lesson is pinned into every later prompt, up
+to two follow-ups jump the queue, it is appended to `BREAKTHROUGHS.md`, and a
+macOS notification is posted.
+
+The judge only ranks work that external checks already accepted; it cannot
+land anything.
+
+## Busy and resting models
+
+Free models are often **busy**: OpenRouter answers 429 "Provider returned
+error" because the upstream provider's free capacity is taken ("temporarily
+rate-limited upstream"). flint retries three times, honouring `Retry-After`,
+then exits 8. The swarm rests that model for 2 minutes (doubling per busy
+spell, at most 30) and **hands the turn to another model**, so a busy reviewer
+or judge no longer sinks an attempt that already has an implementation. A
+role that edits files is handed over only while it has changed nothing;
+reviewers and judges are never the implementer. Handoffs are `handoff` rows in
+`journal.jsonl`, and the model that actually answered gets the credit.
+
+A model this key cannot use at all (403 "only available on agentic harnesses",
+404 no such model; exit 9) is dropped for the run and named in the log: waiting
+would not bring it back, so remove it from the pool. A model that is **down**
+(repeated 5xx or dropped streams; exit 7) rests 30 minutes, doubling up to 12
+hours. Neither lowers its score. Rests are saved
+in `learn.json`, so they survive restarts: startup lists resting models,
+`swarm status` shows them under `resting`, strikes older than 12 hours are
+forgotten, and `swarm wake` ends every rest now. When every model is resting,
+the log says which is back first and when.
+
+## MIT corpus experiment
+
+Does the MIT OpenCourseWare material make these models better? Each attempt is
+randomly assigned, before its implementer runs, to one of two arms
+(`mit_experiment.share_on`, default 0.5). The **with** arm gets excerpts in its
+prompt and the `study` tool for every role. The **without** arm gets neither:
+the tool is hidden from flint. Everything else is shared, so the difference
+between arms estimates the corpus's effect. `swarm report` (and the Cursor
+panel) shows landed rate with 95% Wilson intervals, the difference with its
+interval and a Fisher exact p-value, mean reward, judge scores, study calls per
+attempt, and a per-model table. Below 30 attempts per arm it says the numbers
+are anecdotes. The raw rows are the `attempt` events in `journal.jsonl`;
+`python3 swarm/experiment.py <journal>` prints the table. Set
+`"enabled": false` to give every attempt the corpus.
+
+Retrieval (`swarm/mit_corpus.py`) puts lecture cards first. A card condenses
+one lecture and links the exact source pages. Source pages follow, labelled
+with course, lecture and page. Every hit carries an absolute path, so an agent
+can `read_file` the page a card cites. Raw OCW site pages fill in only when
+nothing better matched. Excerpts are injected into a prompt unasked only when a
+lecture card matches the task. The `study` tool returns whatever matches.
+
+## Review and merge
+
+```sh
+git -C REPO log --oneline main..swarm/trunk
+git -C REPO diff main...swarm/trunk
+git -C REPO merge swarm/trunk        # from your main checkout, when you like it
+```
+
+New commits on `main` are merged into trunk automatically when they merge
+cleanly and keep the tests green. Rejected attempts stay on `swarm/<task>-<id>`
+branches, committed as "not accepted". `keep_worktrees` decides which worktrees
+outlive their attempt: `false` removes them all, `true` (the default) keeps only those
+whose branch holds work trunk does not have, and `"all"` keeps every one.
+
+## Cursor / VS Code extension
+
+`cursor-extension/install.sh` tests, packages and installs the Flint Swarm
+extension into Cursor. From the editor you can:
+
+- ask several free models about the selection, or the function under the cursor, in parallel, with a merged and checked answer;
+- queue a swarm task for the selection, with file and lines attached;
+- see the queue in its own tab, and edit or drop a task from it (hover a row for ✎ and ✕);
+  answering models may use the MIT corpus internally through the `study` tool;
+- start, stop and read reports on the swarm for the current repository.
+
+It talks to `swarm/bridge.py`, a JSON CLI you can also use directly (see its
+docstring). Asking uses read-only agents in the sandbox. It spends the day's
+free requests but not the swarm's reserve. 👍/👎 on an answer trains a
+separate bandit (`swarm/state/consult/learn.json`) that picks which models
+answer next time.
+
+The queue tab reads `bridge.py status` and writes with `queue-edit`,
+`queue-remove` and `queue-clear`. Editing keeps the task's id, dependencies and
+attempt history, and clears a retry backoff so a fixed task is tried again at
+once. Two things are refused rather than done quietly: rewriting a task a worker
+is running right now, and removing a task other queued tasks depend on — those
+can never be claimed without it, so they are only removed together, on a
+confirmation.
+
+### The editor's paid allowance
+
+The swarm cannot spend credits. The extension can, up to a fixed pot, because a
+question whose free models are all rate-limited is otherwise simply lost:
+
+- `editor_wallet` in `config.json` sets it (`cap_usd`, default $5, `enabled`,
+  and `paid_models` to prefer). `bridge.py wallet [--cap N] [--reset]
+  [--disable] [--account]` reads and changes it, as does *Flint Swarm: Set the
+  Paid Model Budget* in the editor.
+- `--paid auto` (the default) spends only when **no** free model answered:
+  one paid model is asked to rescue the question. `--paid off` is free-only;
+  `--paid always` starts with paid models.
+- Configured slugs are checked against OpenRouter's live catalog and skipped if
+  they no longer exist or no longer take tools, so a retired model does not turn
+  into another dead end; failing that, the catalog's cheap tier is used.
+- What is charged is what OpenRouter reports for the request (`usage.cost`),
+  accumulated in `~/.flint/wallet.json` under a file lock and checked before
+  every request, so parallel answers cannot overspend the pot. Only turns the
+  bridge starts for a paid model carry the wallet: a free turn is never stopped
+  because the pot is empty. flint exits 10 when it is.
+
+## Budget
+
+With at least $10 of credits OpenRouter allows 1000 free-model requests per UTC
+day (8 pm Eastern). The swarm reads the real limit and usage from OpenRouter at
+startup and every 15 minutes, keeps `reserve` (100) for you, and waits for the
+reset when the rest is spent. Only `:free` models are used; a paid model in the
+pool is refused unless `allow_paid` is true, so the daemon never spends credits.
+The one exception is the editor's `editor_wallet` above, which is capped in
+dollars and only reachable from the extension.
+`swarm models` lists free tool-capable models; `swarm models --write` resets the
+pool. One worker usually spends the day's allowance, so more workers finish
+sooner, not more; they also land in parallel and conflict more.
+
+`allowance_recheck` (seconds; 300 in the template, off when unset or 0) asks
+OpenRouter again while the allowance looks spent. The local count only climbs
+until midnight and includes requests OpenRouter never charged, so it can read
+1025/1000 while OpenRouter reports 964; with a paid fallback, every turn in
+between is paid for. When OpenRouter reports requests left, the swarm takes
+its count, lifts a daily-cap block it no longer backs, logs `free allowance is
+back`, journals `allowance_restored` and runs the next turn free. It checks at
+startup too, so a counter left over from before a restart is settled first.
+
+An implementer or repair turn also sees how much of its budget is left: each
+round's last tool result ends `[round k of N; M left]`, and with three rounds
+left and nothing edited it is told to stop reading and make the edit. At the
+limit it gets one round offering only `edit_file` and `write_file` before the
+tool-free final answer, and an edit it writes as reply markup is applied rather
+than discarded.
+
+A failed attempt is classified before it costs anything. A **task** failure (the
+tests failed, the reviewer proved a defect) spends one of the task's two
+attempts and then splits or parks it. A **model** failure (no usable output, or
+an edit call that changed nothing) counts the same way against the model that
+made it. A **harness** failure — a step limit, a wall-clock timeout, a sandbox,
+a restart, a provider that did not answer — spends nothing: the task comes back
+in two minutes, the model is not scored for it, and after three of them the task
+is parked with `needs harness look` for a person rather than split into guesses.
+
+Player bug reports reach the queue on their own. Every five minutes the daemon
+reads the arcade's `reports/bugs.jsonl` past a cursor in `state/<slug>/bugs.cursor`
+and files each new one as a `bugfix` task with `origin: "player"` — priority by
+severity, the build and the game state in the detail so its seed reproduces the
+run, and acceptance criteria that ask for a failing test first.
+`bridge.py import-bugs --repo P` does the same by hand.
+
+The Cursor panel's first line says what the swarm is doing — the task, the role,
+the model, the round it is on and how long the turn has taken — from
+`state/<slug>/now.json`, which the daemon rewrites on every tick. Under it: how
+the last 24 hours went (attempts, landed, landed %, the top failure classes,
+what it cost and what it cost per landed commit, red when almost nothing is
+landing), and which config is loaded, red when a tuned one exists and was not.
+Stop now, Stop after this task and Restart are three buttons; the Queue tab
+shows each task's last failure class and offers Retry now, with a section for
+split and parked tasks offering Requeue and their handoff; the Landed tab lists
+the swarm's own trunk commits with model, reward and goal item, and opens one as
+a diff. It refreshes every 10 seconds while a daemon runs and every 60 otherwise.
+
+`swarm service install --repo P [--hours H] [--autostart]` writes a launchd
+agent (`~/Library/LaunchAgents/com.flint.swarm.<slug>.plist`) that restarts a
+crashed daemon, with the repository's own config already selected.
+`--autostart` is what makes it come back at login and after a reboot, and it is
+off unless you ask: this daemon spends real money. `swarm service status` says
+whether it is installed, loaded and set to autostart; `swarm service uninstall`
+removes it.
+
+`owner_window` (disabled by default) pauses the swarm during set local hours.
+
+Most settings take effect without a restart. A worker re-reads the config
+between tasks — never inside one — and applies `models`, `paid_models`, `steps`,
+the timeouts, `max_repairs`, `reviewer_exclude`, the plan and spend settings,
+pacing, `max_queue`, `inject_corpus` and the `corpus_*` keys, logging
+`config reloaded: <keys>`. `repo`, `trunk`, `workers`, `sandbox_write`,
+`base_branch`, `python` and `goal_file` still need a restart, and the daemon
+says so rather than pretending to apply them.
+
+Work survives a restart. At startup the daemon looks for attempts that were cut
+short but left a diff on their branch, saves it as `retained.patch` beside the
+attempt, and the next attempt at that task re-applies it to a fresh worktree and
+goes straight to the gate instead of paying a model to write it again. Nothing
+is trusted: the change still faces the tests and the adversary, and if the patch
+no longer applies to trunk the attempt just proceeds normally.
+
+The daemon also watches its own source. It keeps `swarmd` in memory but spawns
+`flint.py` afresh every turn, so editing the harness while it runs used to leave
+it half on one version and half on another with nothing said. Now it finishes
+the task in flight, checks the new code compiles, and replaces itself with
+`execv` — same pid, same lock, same command. `FLINT_RUN_DEADLINE` carries the
+end of the shift across, so a restart at hour 7 of 8 does not start another 8.
+`restart_on_change: false` turns it off; `restart_min_interval` (300s) stops an
+autosaving editor thrashing it.
+
+A shift is always launched in the background, and a shell hands a background job
+SIGINT set to SIG_IGN, which CPython keeps rather than replacing. The daemon
+takes the signal back explicitly at startup, or `swarm stop` and the panel's
+Stop button would do nothing at all and say nothing about it.
+
+Stopping is per repository. `swarm stop` and `bridge.py stop --repo P` signal
+the pid in that repository's `state/<slug>/daemon.pid`, and only after `ps`
+confirms it is still that repository's daemon; swarms on other repositories keep
+working. `--all` is the machine-wide sweep, and now has to be asked for by name.
+`--drain` (or `kill -USR1 <pid>`) stops after the task in flight finishes
+instead of killing it: 54 attempts and 5.6 hours of model work died mid-turn in
+one day because stopping meant SIGINT.
+
+## Scope, spare time and evidence
+
+Before a worker opens a worktree it checks that the task says enough to be
+worked at all. A task whose declared acceptance says no more than its title,
+or that reads as open-ended ("clean up the whole codebase as needed"), is
+parked with the reason rather than spending an implementer turn, a suite, a
+review and a repair to discover it had nothing to aim at. It is parked and not
+retried: a second attempt cannot supply what the first one was missing. Set
+`scope_gate: false` to turn this off. The Cursor task form runs the same check
+as a preview, so the answer arrives while you are still looking at the form.
+
+When there is genuinely nothing else to do — no task ready, nothing in flight,
+no roadmap packet held, and more than half an hour of the shift left — the
+daemon looks for one improvement of its own (`idle_improvement`, on by default,
+`idle_improvement_cooldown` seconds between cycles). One is open at a time, the
+cycles persist across restarts in `idle-improvements.json`, whatever it proposes
+goes through the same scope gate, and it is queued at priority -1 so any real
+task outranks it. "Nothing worth doing" is a valid answer and is recorded as one.
+
+A reviewer that cannot produce a readable verdict is replaced rather than ending
+the attempt: the same candidate goes to another reviewer, up to
+`max_review_formats` extra times (default 2). This does not touch the repair
+budget — nothing has yet been said about the code.
+
+Each attempt writes its own bundle to `state/<repo>/attempts/<task id>-<worker>-<stamp>/`
+with `HANDOFF.md`, `attempt.json`, the contract, the reviews and the gate logs.
+The newest `keep_attempts` bundles (default 300) are kept. The panel links to
+them from the queue and the parked list; `bridge.py evidence --repo R --id T`
+prints them.
+
+### Known gap: browser acceptance criteria
+
+A packet whose acceptance is a browser behaviour cannot be verified from this
+repository — the browser, the page and the harness that drives them all live in
+the target game repository. The swarm reports such a packet honestly rather than
+treating an absent browser as a pass, but it cannot close one on its own. Those
+criteria need a check in the game repository's own suite, invoked through its
+`test_cmd`, before the swarm can accept work against them.
+
+## Safety
+
+Agents and the test command run under a macOS `sandbox-exec` profile: writes
+only to the task's worktree, its Git metadata, `~/.flint`, temp and package
+caches; `.env` files, `~/.ssh`, `~/.aws` and similar are unreadable; secret-like
+environment variables are removed from test runs and agent shell commands. The
+supervisor's Git commands ignore hooks. Network access remains open, so this
+contains accidents, not a determined attacker. `grind` runs `caffeinate`: the
+Mac stays awake unless the lid is closed on battery.
+
+## State and files
+
+Per target repository: `swarm/state/<repo>-<hash>/` holds the queue, journal,
+`learn.json` (bandits, playbook, history), `BREAKTHROUGHS.md` and `REPORT.md`;
+`swarm/logs/<repo>-<hash>/` holds per-role logs. The study corpus is
+`~/.flint/corpus.db` (`FLINT_CORPUS_ROOT` if it was built from another folder); rebuild it with
+`.venv/bin/python swarm/corpus_index.py build --root ~/Documents/flint-training --prune`
+(add `--budget 150` and rerun if it stops early). The MIT OpenCourseWare index lives in
+`~/Documents/flint-training/MIT OCW Courses/agent-skills/`: start at `FLINT-INDEX.md`
+(domain -> topic -> lecture card -> source page). It is a copy of
+`~/Desktop/college/MIT OCW Courses/agent-skills/`; refresh it with that folder's
+`scripts/sync_to_flint.sh` after rebuilding the course skills.
+
+Exit codes from flint turns: 1 error, 3 provider daily cap, 4 credit/account
+limit, 5 step limit, 6 local budget pause, 7 provider unavailable, 8 model busy
+(rate-limited upstream), 9 model not available to this key, 130 Ctrl-C.
+
+The target must be the repository that actually holds the code. A folder that
+merely contains projects is searched one level down for a single testable
+project; a project with its own `.git` is refused, because Git keeps an
+embedded repository's files out of its parent, so the swarm's worktrees would
+be empty where that code should be.
+
+```sh
+.venv/bin/python -m unittest discover -s tests -v
+```
+
+
+### Role deadlines and mechanical tasks
+
+`role_timeouts` overrides `turn_timeout` per role (seconds). For example, use
+`{"implementer": 900, "repair": 900, "adversary": 300, "judge": 300}`.
+An omitted role keeps the existing `turn_timeout` behavior.
+Timeouts are logged as `agent_timeout` with the role, actual model, deadline,
+and retained turn log; partial output is kept in that log. Partial implementation
+or repair edits pass through the normal tests and review before they can land.
+An unsuccessful attempt that timed out is decomposed before another full retry;
+at the recursion limit it is parked. A zero-child decomposition leaves the parent marked `split`
+for inspection, rather than automatically retrying the same oversized task.
+
+A task that can no longer finish — parked, or split into no subtasks — takes its dependents
+with it: every queued task waiting on it, directly or through another, is parked with
+`blocked: prerequisite '<title>' ...` as its note and a `stranded` journal line. Without this a
+dead prerequisite left its whole chain waiting for ever, invisibly, holding queue slots the
+planner could not reclaim. When a split does produce subtasks, anything that waited on the
+parent is moved onto the last subtask instead.
+
+For a fully specified mechanical edit, use `swarm add TITLE --detail DETAIL
+--execution-class fast` (or queue metadata `"execution_class": "fast"`). Fast tasks
+keep the project rules, acceptance criteria, tests and review gates, but omit
+study material, historical playbooks and architect calls. Implementation and
+repair turns are capped at four rounds and 300 seconds. Classification is
+explicit: ordinary feature tasks keep their existing workflow.
+
+These settings and supervisor changes take effect when the daemon next starts.
+
+## Running a coordinator-approved roadmap
+
+Set `roadmap_file` to a committed task file such as `docs/roadmap/tasks.json`.
+The daemon reads it and `docs/roadmap/EXECUTION.json` from `swarm/trunk`, never
+from uncommitted edits. Implementation must be explicitly activated in the ledger.
+Only swarm packets with accepted dependencies and recorded coordinator/ownership
+evidence are queued, with at most five pending packets. Accepted worker results
+must name a commit present on trunk before they unlock their successors.
+
+In this mode the model planner, generated follow-ups, automatic decomposition
+and bug-report import cannot add work outside the roadmap. Failed packets stay
+blocked for coordinator review; future waves cannot bypass them. Coordinator
+gates still require real evidence entered by the coordinator. Live packet status,
+accepted commits and missing gates are in the repository's swarm state directory
+as `roadmap-execution.json`; the committed ledger records coordinator decisions.
+
+Every packet that is neither accepted nor in flight appears in `blocked` there,
+with `reason` (`dependency`, `coordinator_gate`, `coordinator_owned`,
+`attempt_failed`, `unverified_completion` or `queue_full`), what it is
+`waiting_on`, what it `blocks`, and the one `next_action` that would release it.
+`roots` lists the blockers that wait on nothing else already held or already
+being worked: those are the ones a person has to act on, and they are logged and
+journalled once each time the set changes.
+
+A packet whose attempt failed is held rather than retried. To authorise another
+run, record a dated decision in the committed ledger and the next dispatch picks
+it up as `<title> (retry 2)`:
+
+```json
+{"packets": {"F02": {"retry": {"reason": "browser was missing; installed on the runner",
+                               "at": "2026-09-27T21:40:00"}}}}
+```
+
+The `at` must be later than the failed attempt. An undated note authorises
+nothing, because it would re-authorise every future failure too.
+
+Use `grind /path/to/repo --hours 8 --goal GOAL.md` for a bounded shift. Preflight
+verification counts toward the deadline, which survives daemon code restarts.

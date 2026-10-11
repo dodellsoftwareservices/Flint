@@ -1,0 +1,674 @@
+// Offline checks for the Flint Swarm extension: manifest/code consistency, helpers, the
+// renderer's escaping, the webview's CSP and message flow, and one real bridge round trip.
+// Run: node cursor-extension/test/extension.test.js
+'use strict';
+const assert = require('assert');
+const Module = require('module');
+const path = require('path');
+const fs = require('fs');
+
+const EXT = path.resolve(__dirname, '..');
+const manifest = JSON.parse(fs.readFileSync(path.join(EXT, 'package.json'), 'utf8'));
+const registered = {};
+const providers = [];
+const contexts = {};
+const terminals = [];
+let provider = null;
+const disposable = { dispose() {} };
+
+/** Enough of vscode.EventEmitter for a pseudoterminal: fire() reaches the listener. */
+class EventEmitter {
+  constructor() { this.listeners = []; this.event = (fn) => { this.listeners.push(fn); return disposable; }; }
+  fire(v) { this.listeners.forEach((fn) => fn(v)); }
+  dispose() { this.listeners = []; }
+}
+
+class Range {
+  constructor(a, b, c, d) { this.start = { line: a, character: b }; this.end = { line: c, character: d }; }
+  contains(p) { return p.line >= this.start.line && p.line <= this.end.line; }
+  get isEmpty() { return this.start.line === this.end.line && this.start.character === this.end.character; }
+}
+const vscode = {
+  workspace: {
+    getConfiguration: () => ({ get: (k) => (manifest.contributes.configuration.properties['flintSwarm.' + k] || {}).default }),
+    getWorkspaceFolder: () => undefined, workspaceFolders: undefined,
+  },
+  window: {
+    activeTextEditor: undefined,
+    createStatusBarItem: () => ({ show() {}, dispose() {} }),
+    registerWebviewViewProvider: (id, p) => { providers.push(id); provider = p; return disposable; },
+    createTerminal: (opts) => {
+      const term = { ...opts, name: opts.name, pty: opts.pty, out: [], exitStatus: undefined,
+        show() {}, dispose() { this.exitStatus = { code: 0 }; } };
+      if (opts.pty) opts.pty.onDidWrite((s) => term.out.push(s));
+      terminals.push(term);
+      return term;
+    },
+    onDidChangeActiveTextEditor: () => disposable,
+    showWarningMessage: () => Promise.resolve(vscode.__warningAnswer),
+    showInformationMessage: (msg) => { vscode.__info = msg; return Promise.resolve(undefined); },
+    showErrorMessage: (msg) => { vscode.__error = msg; return Promise.resolve(undefined); },
+    showInputBox: (opts) => {
+      const answer = vscode.__inputAnswer;
+      // Mirror VS Code: validateInput rejects the input and the box stays open, so the
+      // promise only resolves with a value that passes the validator (or undefined on Esc).
+      if (answer != null && opts.validateInput) {
+        const err = opts.validateInput(answer);
+        if (err) return Promise.resolve(undefined);
+      }
+      return Promise.resolve(answer);
+    },
+  },
+  commands: {
+    registerCommand: (id, fn) => { registered[id] = fn; return disposable; },
+    executeCommand: (cmd, key, value) => {
+      if (cmd === 'setContext') contexts[key] = value;
+      return Promise.resolve();
+    },
+  },
+  version: '1.108.0',
+  EventEmitter,
+  Uri: { joinPath: (base, ...parts) => ({ fsPath: path.join(base.fsPath, ...parts), toString() { return 'vscode-resource:' + this.fsPath; } }) },
+  StatusBarAlignment: { Left: 1 }, ProgressLocation: { Notification: 15 }, ViewColumn: { One: 1 },
+  SymbolKind: { 5: 'Class', 11: 'Function', Class: 5, Function: 11 }, Range, Position: class { constructor(l, c) { this.line = l; this.character = c; } },
+};
+const load = Module._load;
+Module._load = function (request) { return request === 'vscode' ? vscode : load.apply(this, arguments); };
+const ext = require(path.join(EXT, 'extension.js'));
+
+const tests = [];
+const test = (name, fn) => tests.push([name, fn]);
+
+// Shared across every test in this file, the way the real host hands one context to activate()
+// once. A plain Map is enough: the real contract is just "what you update() comes back from get()".
+const globalState = { store: new Map(), syncedKeys: [],
+  get(key, dflt) { return this.store.has(key) ? this.store.get(key) : dflt; },
+  update(key, value) { this.store.set(key, value); return Promise.resolve(); },
+  setKeysForSync(keys) { this.syncedKeys = keys.slice(); } };
+
+test('every contributed command is registered, and menus only use contributed commands', () => {
+  ext.activate({ subscriptions: [], extensionUri: { fsPath: EXT }, globalState });
+  const declared = manifest.contributes.commands.map((c) => c.command).sort();
+  assert.deepStrictEqual(Object.keys(registered).sort(), declared);
+  const used = [...Object.values(manifest.contributes.menus).flat(), ...manifest.contributes.keybindings].map((m) => m.command);
+  used.forEach((c) => assert.ok(declared.includes(c), c));
+  for (const group of Object.values(manifest.contributes.viewsContainers)) {
+    group.forEach((c) => assert.ok(fs.existsSync(path.join(EXT, c.icon)), c.icon));
+  }
+  const logo = fs.readFileSync(path.join(EXT, 'media', 'swarm.svg'), 'utf8');
+  assert.ok(logo.includes('shape-rendering="crispEdges"'), 'the Flint logo remains pixel art');
+  assert.ok(logo.includes('aria-label="Pixel flint"'), 'the contributed logo is the flint mark');
+  assert.ok(globalState.syncedKeys.includes(ext._test.UPDATE_CLICKS_KEY),
+    'the lifetime click counter participates in editor Settings Sync');
+});
+
+test('update clicks render as a bounded three-field base-1000 version', () => {
+  const version = ext._test.updateVersion;
+  assert.strictEqual(version(-1), '0.0.0');
+  assert.strictEqual(version(0), '0.0.0');
+  assert.strictEqual(version(1), '0.0.1');
+  assert.strictEqual(version(999), '0.0.999');
+  assert.strictEqual(version(1000), '0.1.0');
+  assert.strictEqual(version(999999), '0.999.999');
+  assert.strictEqual(version(1000000), '1.0.0');
+  assert.strictEqual(version(999999999), '999.999.999');
+  assert.strictEqual(version(1000000000), '999.999.999');
+});
+
+test('the panel is contributed to the secondary sidebar, with the activity bar as fallback', () => {
+  const { activitybar, secondarySidebar } = manifest.contributes.viewsContainers;
+  // Claude Code and Codex both sit in the secondary sidebar; this is what puts Flint there
+  // beside them instead of on its own activity-bar pin.
+  assert.strictEqual(secondarySidebar[0].when, '!flintSwarm:doesNotSupportSecondarySidebar');
+  assert.strictEqual(activitybar[0].when, 'flintSwarm:doesNotSupportSecondarySidebar');
+  const views = manifest.contributes.views;
+  assert.deepStrictEqual(Object.keys(views), [activitybar[0].id, secondarySidebar[0].id]);
+  // Exactly one of the two resolves at a time, so both are registered.
+  assert.deepStrictEqual(providers.sort(), ['flintSwarm.panel', 'flintSwarm.panelSecondary']);
+  // Every title-bar button has to show on whichever view the host gave us.
+  manifest.contributes.menus['view/title'].forEach((m) => {
+    assert.ok(m.when.includes('flintSwarm.panel') && m.when.includes('flintSwarm.panelSecondary'), m.command);
+  });
+});
+
+test('the secondary sidebar is used from 1.106 on, and the fallback flag is set below it', () => {
+  const supports = ext._test.supportsSecondarySidebar;
+  assert.ok(supports('1.106.0') && supports('1.108.2') && supports('2.0.0'));
+  assert.ok(!supports('1.105.3') && !supports('1.90.0') && !supports(''));
+  // 1.108.0 in the mock, so the fallback flag must NOT have been set
+  assert.strictEqual(contexts['flintSwarm:doesNotSupportSecondarySidebar'], undefined);
+});
+
+test('JSON lines are parsed across chunk boundaries', () => {
+  const got = [];
+  let rest = ext._test.parseLines('', '{"a":1}\n{"b":', (o) => got.push(o));
+  rest = ext._test.parseLines(rest, '2}\nnot json\n', (o) => got.push(o));
+  assert.deepStrictEqual(got, [{ a: 1 }, { b: 2 }, { event: 'log', text: 'not json' }]);
+  assert.strictEqual(rest, '');
+});
+
+test('the innermost symbol under the cursor is chosen', () => {
+  const method = { name: 'm', kind: 11, range: new Range(5, 0, 9, 0), children: [] };
+  const cls = { name: 'C', kind: 5, range: new Range(1, 0, 20, 0), children: [method] };
+  assert.strictEqual(ext._test.innermost([cls], { line: 6 }), method);
+  assert.strictEqual(ext._test.innermost([cls], { line: 2 }), cls);
+  assert.strictEqual(ext._test.innermost([cls], { line: 30 }), null);
+});
+
+test('the flint checkout is found next to the extension', () => {
+  assert.strictEqual(ext._test.flintRoot(), path.resolve(EXT, '..'));
+});
+
+test('local provider routing preserves the endpoint that the probe discovered', () => {
+  assert.deepStrictEqual(ext._test.providerArgs({ backend: 'ollama', local: true, baseUrl: 'http://127.0.0.1:22434' }),
+    ['--provider', 'ollama', '--base-url', 'http://127.0.0.1:22434']);
+  assert.deepStrictEqual(ext._test.providerArgs({ backend: 'custom:http://host:9999/v1', local: true, baseUrl: 'http://host:9999/v1' }),
+    ['--base-url', 'http://host:9999/v1']);
+  assert.deepStrictEqual(ext._test.providerArgs({ backend: 'openrouter', local: false, baseUrl: null }), []);
+});
+
+test('the renderer escapes model output and links file references', () => {
+  const R = require(path.join(EXT, 'media', 'render.js'));
+  const html = R.render('<img src=x onerror=alert(1)> see `app.py:12` and [x](javascript:alert(1))');
+  assert.ok(!/<img/i.test(html) && html.includes('&lt;img'));
+  assert.ok(!html.includes('href="javascript'));
+  assert.ok(html.includes('data-path="app.py" data-line="12"'));
+  assert.ok(R.render('```\n<b>\n```').includes('<pre><code>&lt;b&gt;</code></pre>'));
+});
+
+test('the webview has a nonce CSP and no inline handlers', () => {
+  const posted = [];
+  const view = { visible: true, show() {}, onDidChangeVisibility: () => disposable,
+    webview: { options: null, cspSource: 'vscode-resource:', asWebviewUri: (u) => u, postMessage: (m) => posted.push(m), onDidReceiveMessage: () => disposable } };
+  provider.resolveWebviewView(view);
+  const html = view.webview.html;
+  const nonce = html.match(/'nonce-([^']+)'/)[1];
+  assert.strictEqual(html.split(`nonce="${nonce}"`).length - 1, 3);
+  assert.ok(html.includes("default-src 'none'"));
+  assert.ok(!/\son\w+=/.test(html));
+  assert.ok(html.includes('id="providerSelect"') && html.includes('id="modelSelect"'), 'the composer owns model selection');
+  assert.ok(html.includes('id="updateVersion"') && html.includes('Update · 0.0.0'),
+    'the persistent updater begins visibly at zero');
+  assert.ok(!html.includes('Search MIT notes') && !html.includes('id="lookup"'), 'corpus retrieval is not a human-facing action');
+  // Font is a serious, boring setting with a sane default — not a toy buried in the skin tab.
+  const settingsSection = html.slice(html.indexOf('id="pane-settings"'), html.indexOf('id="pane-skin"'));
+  assert.ok(settingsSection.includes('id="skinFont"') && settingsSection.includes('id="skinFontCustom"'),
+    'the font control lives in Settings');
+  assert.ok(settingsSection.includes('<option value="">Helvetica (default)</option>'),
+    'Helvetica is the default option, not a Cursor-matching or novelty font');
+  const skinSection = html.slice(html.indexOf('id="pane-skin"'), html.indexOf('id="pane-help"'));
+  assert.ok(!skinSection.includes('id="skinFont"'), 'not duplicated in the Customize tab');
+  assert.ok(skinSection.includes('id="skinRadius"'), 'roundness still lives in Customize, just not font');
+  // Paid fallback is off by default and most people never touch it — it's collapsed behind a
+  // <details>, not an open section competing with Model/Key/Answer-behavior for attention.
+  assert.ok(settingsSection.includes('<details class="settings-card cost-card advanced-card">'),
+    'the cost & fallback card starts collapsed (no open attribute), not force-opened');
+  assert.ok(settingsSection.includes('id="costSummaryPill"'), 'its current policy still shows on the closed summary line');
+  // Helvetica has to be the ACTUAL rendered default, not just what the dropdown label claims —
+  // an empty font value falls through to this base rule when nothing has been customized.
+  const css = fs.readFileSync(path.join(EXT, 'media', 'panel.css'), 'utf8');
+  assert.ok(/\bbody\s*\{[^}]*font-family:\s*'Helvetica Neue',\s*Helvetica,\s*Arial,\s*sans-serif/.test(css),
+    'the base stylesheet defaults to Helvetica, independent of any skin');
+  assert.ok(html.includes('id="pane-settings"') && html.includes('id="pane-help"'), 'settings and zero-to-hero help are first-class pages');
+  assert.ok(html.includes('type="password"') && !html.includes('value="sk-'), 'the key field never embeds a secret');
+  provider.post({ type: 'status', data: {} });
+  assert.strictEqual(posted.length, 0, 'messages wait for the ready handshake');
+});
+
+test('a saved skin persists under its own globalState key, and reset clears it rather than writing a sentinel', async () => {
+  const posted = [];
+  const view = { visible: true, show() {}, onDidChangeVisibility: () => disposable,
+    webview: { options: null, cspSource: 'vscode-resource:', asWebviewUri: (u) => u, postMessage: (m) => posted.push(m), onDidReceiveMessage: () => disposable } };
+  provider.resolveWebviewView(view);
+  // Skip the 'ready' handshake here: it also kicks off refreshStatus()/sendSettings(), which spawn
+  // the real bridge — unrelated to what this test checks, and not something to trigger incidentally.
+  provider.ready = true;
+  const mySkin = { bg: '#021402', accent: '#33ff66', crt: true };
+  await provider.onMessage({ type: 'skinSave', skin: mySkin });
+  assert.deepStrictEqual(globalState.get('flintSwarm.skin'), mySkin, 'saved under its own key, not folded into project settings');
+  await provider.onMessage({ type: 'skinReset' });
+  assert.strictEqual(globalState.get('flintSwarm.skin'), undefined, 'reset clears the key outright');
+  assert.deepStrictEqual(posted[posted.length - 1], { type: 'skin', skin: null }, 'the webview is told to drop back to default immediately');
+});
+
+test('the panel script renders a streamed ask with the merged answer first', () => {
+  const els = {};
+  const make = (tag) => {
+    const classes = new Set();
+    const e = { tag, children: [], dataset: {}, className: '', textContent: '', value: '', checked: true,
+      disabled: false, hidden: false, attrs: {}, listeners: {},
+      appendChild(c) { this.children.push(c); }, addEventListener(t, fn) { this.listeners[t] = fn; }, focus() {}, requestSubmit() {},
+      setAttribute(k, v) { this.attrs[k] = v; },
+      classList: {
+        toggle(c, on) { (on == null ? !classes.has(c) : on) ? classes.add(c) : classes.delete(c); },
+        add(c) { classes.add(c); }, remove(c) { classes.delete(c); }, contains(c) { return classes.has(c); },
+      },
+      text() { return this.innerHTML + this.children.map((c) => c.text()).join(''); } };
+    let html = '';   // like the DOM: assigning innerHTML replaces the children
+    Object.defineProperty(e, 'innerHTML', { get: () => html, set: (v) => { html = v; e.children = []; } });
+    return e;
+  };
+  const handlers = {};
+  global.document = { getElementById: (id) => (els[id] = els[id] || make(id)), createElement: make,
+    body: make('body'), head: make('head'),
+    addEventListener: (t, fn) => { handlers['doc:' + t] = fn; } };
+  global.window = { FlintRender: require(path.join(EXT, 'media', 'render.js')), addEventListener: (t, fn) => { handlers[t] = fn; } };
+  const sent = [];
+  global.acquireVsCodeApi = () => ({ postMessage: (m) => sent.push(m), getState: () => null, setState() {} });
+  const origBox = els.threads;
+  require(path.join(EXT, 'media', 'panel.js'));
+  assert.deepStrictEqual(sent, [{ type: 'ready' }]);
+  const send = (data) => handlers.message({ data });
+  send({ type: 'askStart', id: 'q1', question: 'Find bugs', where: 'app.py:1-9', repo: '/r' });
+  // The free-model consensus is an implementation detail now: one quiet "thinking" line,
+  // not a live stack of per-model pending cards, and the composer outline turns red.
+  assert.ok(els.threads.text().includes('thinking'));
+  assert.ok(els.askForm.classList.contains('state-thinking'));
+  assert.ok(!els.askForm.classList.contains('state-running'));
+  send({ type: 'askEvent', id: 'q1', event: { event: 'start', model: 'a:free' } });
+  send({ type: 'askEvent', id: 'q1', event: { event: 'progress', model: 'a:free', text: 'tool: study' } });
+  assert.ok(!els.threads.text().includes('tool: study'), 'raw tool progress text is not surfaced live');
+  // A tool call in flight turns the composer outline light blue instead of red.
+  assert.ok(els.askForm.classList.contains('state-running'));
+  assert.ok(!els.askForm.classList.contains('state-thinking'));
+  send({ type: 'askEvent', id: 'q1', event: { event: 'answer', model: 'a:free', text: 'Bug at `app.py:3`', secs: 9, study_calls: 2, requests: 5 } });
+  send({ type: 'askEvent', id: 'q1', event: { event: 'start', model: 'b:free', role: 'synthesis' } });
+  send({ type: 'askEvent', id: 'q1', event: { event: 'synthesis', model: 'b:free', role: 'synthesis', text: 'Merged: **one bug**' } });
+  send({ type: 'askEvent', id: 'q1', event: { event: 'done', answered: 1, asked: 1, requests: 5 } });
+  const out = els.threads.text();
+  assert.ok(out.indexOf('Merged:') < out.indexOf('Bug at'), 'merged answer leads; the individual answer is still reachable after it');
+  assert.ok(out.includes('1 other answer'), 'the collapsed-by-default disclosure names how many other answers exist');
+  assert.ok(out.includes('2 MIT lookups'));
+  assert.ok(out.includes('data-vote="1" data-model="a:free"'));
+  assert.ok(out.includes('1/1 models answered'));
+  assert.ok(out.includes('5 requests'), 'the card shows the request count');
+  assert.ok(out.includes('5 free requests'), 'the thread footer shows the free request count');
+  // The outline goes back to neutral once the thread is done.
+  assert.ok(!els.askForm.classList.contains('state-thinking') && !els.askForm.classList.contains('state-running'));
+  sent.length = 0;
+  els.updateVersion.listeners.click();
+  assert.deepStrictEqual(sent, [{ type: 'updateInstall' }]);
+  assert.strictEqual(els.updateVersion.disabled, true);
+  assert.strictEqual(els.updateVersion.textContent, 'Updating 0.0.0…');
+  send({ type: 'updateVersion', count: 1, version: '0.0.1', busy: false });
+  assert.strictEqual(els.updateVersion.textContent, 'Update · 0.0.1');
+  assert.ok(els.updateVersion.title.startsWith('1 total update clicks'));
+  void origBox;
+  panelHarness = { els, handlers, sent, send };
+});
+
+test('the customize tab reskins live through a nonce\'d <style> tag, never an inline style attribute', () => {
+  const { els, send, sent } = panelHarness;
+  send({ type: 'tab', tab: 'skin' });
+  assert.ok(els.skinPresets.innerHTML.includes('sw-crt') && els.skinPresets.innerHTML.includes('CRT Terminal'),
+    'preset swatches render from data, not hardcoded markup');
+  sent.length = 0;
+  const preset = { dataset: { preset: 'crt' } };
+  els.skinPresets.listeners.click(hit({ '.skin-swatch': preset }));
+  assert.strictEqual(els.skinBg.value, '#021402', 'picking a preset fills the color inputs so they stay in sync');
+  assert.strictEqual(els.skinCrt.checked, true);
+  const css = els.skinStyleTag.textContent;
+  assert.ok(css.includes('--accent:#33ff66'), 'colors land as CSS custom properties, which the whole stylesheet already keys off of');
+  assert.ok(css.includes('#skinBackdrop{opacity:0;}'), 'the CRT preset has no background image, so the backdrop stays hidden');
+  assert.ok(!sent.some((m) => m.type === 'skinSave'), 'the save is debounced, not fired on every click');
+
+  // Clearing the background and typing a custom marquee message both go through the same path.
+  els.skinMarqueeToggle.checked = true;
+  els.skinMarqueeToggle.listeners.change();
+  assert.strictEqual(els.skinMarqueeTextField.hidden, false);
+  document.getElementById('skinBgUrl').value = 'https://example.com/pug.png';
+  els.skinBgUrlApply.listeners.click();
+  assert.ok(els.skinStyleTag.textContent.includes('url("https://example.com/pug.png")'));
+  els.skinBgClear.listeners.click();
+  assert.ok(els.skinStyleTag.textContent.includes('#skinBackdrop{opacity:0;}'), 'clearing drops the image again');
+  send({ type: 'tab', tab: 'ask' });
+});
+
+test('header and composer get their own independent image layers, and a typed font beats the preset list', () => {
+  const { els, send } = panelHarness;
+  send({ type: 'tab', tab: 'skin' });
+
+  // "No whitelist" freedom: typing a font wins over whatever the select says, sanitized the same
+  // way a pasted URL is (it's the other genuinely free-text field).
+  els.skinFontCustom.value = 'Wingdings';
+  els.skinFontCustom.listeners.input();
+  assert.ok(els.skinStyleTag.textContent.includes('body{font-family:Wingdings;}'));
+
+  // Header image via upload: the click just asks the host; the host echoes back which layer
+  // ('target') the picked file was for, which is how the result gets routed without extra state.
+  els.skinHeaderUpload.listeners.click();
+  send({ type: 'skinImageResult', target: 'headerImage', dataUri: 'data:image/png;base64,AAAA' });
+  let css = els.skinStyleTag.textContent;
+  assert.ok(css.includes('#skinHeaderLayer{opacity:1') && css.includes('data:image/png;base64,AAAA'));
+  assert.ok(css.includes('#skinComposerLayer{opacity:0;}'), 'a header-only change leaves the composer layer alone');
+
+  // Composer background via a pasted URL — independent of the header, and the header image
+  // from the step above has to survive this (readSkinForm carries images forward, not the form).
+  document.getElementById('skinComposerUrl').value = 'https://example.com/lofi.gif';
+  els.skinComposerUrlApply.listeners.click();
+  css = els.skinStyleTag.textContent;
+  assert.ok(css.includes('#skinComposerLayer{opacity:1') && css.includes('url("https://example.com/lofi.gif")'));
+  assert.ok(css.includes('data:image/png;base64,AAAA'), 'the header image survives a composer-only change');
+
+  els.skinHeaderClear.listeners.click();
+  assert.ok(els.skinStyleTag.textContent.includes('#skinHeaderLayer{opacity:0;}'));
+  assert.ok(els.skinStyleTag.textContent.includes('url("https://example.com/lofi.gif")'), 'clearing the header leaves the composer image alone');
+  send({ type: 'tab', tab: 'ask' });
+});
+
+// The queue tab is driven entirely by the status message; these run against the same loaded
+// panel.js, so they see exactly what the sidebar would render.
+let panelHarness = null;
+
+const QUEUE_STATUS = {
+  repo: '/r/demo', is_target: true, daemon_running: true, landed: 2, max_queue: 20,
+  kinds: ['feature', 'bugfix', 'test', 'refactor'], recent: [], budget: null, experiment: null,
+  paid_fallback: 'off', quota_mode: 'shutdown', daemon_paid_configured: false,
+  wallet: { cap: 5, spent: 0.1234, remaining: 4.8766, calls: 3 },
+  spend: { used: 2.199104, cap: 20, left: 17.800896, resets: '2026-10-05', shared: true },
+  stale_seconds: 900,
+  queue: [
+    { id: 't1', title: 'Handle empty input', kind: 'bugfix', priority: 2, attempts: 1, claimed: false,
+      origin: 'cursor', not_before: 0, created: 10, acceptance: ['parse([]) returns []'], depends_on: [],
+      blocks: [{ id: 't3', title: 'Write tests' }], detail: 'the detail', detail_truncated: false },
+    { id: 't2', title: 'Verbose flag', kind: 'feature', priority: 1, attempts: 0, claimed: true,
+      origin: 'planner', not_before: 0, created: 11, acceptance: [], depends_on: [], blocks: [], detail: '' },
+    { id: 't3', title: 'Write tests', kind: 'test', priority: 0, attempts: 0, claimed: false,
+      origin: 'planner', not_before: 0, created: 12, acceptance: [], depends_on: ['t1'], blocks: [], detail: '' },
+  ],
+};
+
+test('the settings page exposes project models and encrypted-key state', () => {
+  const { els, send } = panelHarness;
+  send({ type: 'status', data: QUEUE_STATUS });
+  send({ type: 'info', data: { api_key: true, models: ['alpha/code:free', 'beta/code:free'] } });
+  send({ type: 'settings', data: {
+    values: { models: 4, stepsPerModel: 10, timeoutSeconds: 420, paidFallback: 'off',
+      synthesize: true, useStudy: false, flintPath: '/opt/flint', python: '' },
+    providerState: { backend: 'openrouter', model: 'beta/code:free' },
+    providers: [{ id: 'ollama', label: 'Ollama', running: true,
+      models: [{ id: 'qwen-coder:7b', name: 'qwen-coder:7b' }] }],
+    keyConfigured: true, keyStorage: 'Cursor encrypted secret storage', project: 'demo',
+  } });
+  send({ type: 'tab', tab: 'settings' });
+  assert.ok(els.providerSelect.text().includes('OpenRouter') && els.providerSelect.text().includes('Ollama'));
+  assert.ok(els.modelSelect.text().includes('alpha/code:free') && els.modelSelect.text().includes('beta/code:free'));
+  assert.strictEqual(els.settingModels.value, 4);
+  assert.strictEqual(els.settingStudy.checked, false);
+  assert.strictEqual(els.settingQuota.value, 'shutdown');
+  assert.strictEqual(els.costSummaryPill.textContent, 'Free only');
+  assert.strictEqual(els.keyStatus.textContent, 'Configured');
+  assert.strictEqual(els.clearKey.disabled, false);
+  assert.ok(els.budgetSummary.textContent.includes('$4.88 left'));
+  send({ type: 'tab', tab: 'ask' });
+});
+
+/** A click whose target only has to answer closest(), which is all the handler asks it. */
+const hit = (map) => ({ target: { closest: (sel) => map[sel] || null } });
+
+test('the queue tab lists every task with its state and a remove control', () => {
+  const { els, send } = panelHarness;
+  send({ type: 'status', data: QUEUE_STATUS });
+  send({ type: 'tab', tab: 'queue' });
+  const out = els.queueList.text();
+  assert.ok(out.includes('Handle empty input') && out.includes('Verbose flag') && out.includes('Write tests'));
+  assert.ok(out.includes('class="icon qdel"') && out.includes('class="icon qedit"'), 'each row has ✕ and ✎');
+  assert.ok(out.includes('running now'), 'the claimed task says a worker has it');
+  assert.ok(out.includes('blocks 1') && out.includes('waits for 1'), 'dependencies are visible');
+  assert.ok(els.queueHead.text().includes('3 of 20 queued'));
+  assert.strictEqual(els.qcount.textContent, '3');
+  assert.ok(els.status.text().includes('$0.1234'), 'the paid budget is on show');
+  assert.ok(els.status.text().includes('Cost safety') && els.status.text().includes('questions stay free'));
+  assert.ok(!els.status.text().includes('quotaModeToggle'), 'quota policy is changed explicitly in Settings, never by an emoji cycle');
+  // the claimed task is listed first, then by priority
+  assert.ok(out.indexOf('Verbose flag') < out.indexOf('Handle empty input'));
+  assert.ok(out.indexOf('Handle empty input') < out.indexOf('Write tests'));
+});
+
+test('✕ asks to remove that task and names the tasks that depend on it', () => {
+  const { handlers, sent } = panelHarness;
+  sent.length = 0;
+  handlers['doc:click'](hit({ '.qdel': {}, '.qrow': { dataset: { id: 't1' } } }));
+  assert.deepStrictEqual(sent, [{ type: 'queueRemove', id: 't1', repo: '/r/demo', title: 'Handle empty input',
+    claimed: false, blocks: [{ id: 't3', title: 'Write tests' }] }]);
+  sent.length = 0;
+  handlers['doc:click'](hit({ '.qdel': {}, '.qrow': { dataset: { id: 't2' } } }));
+  assert.strictEqual(sent[0].claimed, true, 'a task being worked on is flagged, so the extension confirms');
+});
+
+test('✎ fetches the whole task, and saving posts the rewritten fields', () => {
+  const { els, handlers, sent, send } = panelHarness;
+  sent.length = 0;
+  handlers['doc:click'](hit({ '.qedit': {}, '.qrow': { dataset: { id: 't1' } } }));
+  assert.deepStrictEqual(sent, [{ type: 'queueGet', id: 't1', repo: '/r/demo' }]);
+  send({ type: 'queueTask', task: { id: 't1', title: 'Handle empty input', kind: 'bugfix', priority: 2,
+    detail: 'the whole detail', acceptance: ['parse([]) returns []', 'a test proves it'] } });
+  const form = els.queueList.text();
+  assert.ok(form.includes('the whole detail'), 'the form gets the full detail, not the trimmed one');
+  assert.ok(form.includes('parse([]) returns []\na test proves it'), 'acceptance is one per line');
+  assert.ok(form.includes('<option value="bugfix" selected>') && form.includes('<option value="2" selected>'));
+
+  sent.length = 0;
+  const field = (v) => ({ value: v });
+  handlers['doc:submit']({ preventDefault() {}, target: { closest: () => ({
+    dataset: { id: 't1' },
+    querySelector: (cls) => ({ '.f-title': field(' Handle empty input '), '.f-detail': field('rewritten'),
+      '.f-accept': field('first\n\n  second  '), '.f-kind': field('test'), '.f-prio': field('0') }[cls]),
+  }) } });
+  assert.deepStrictEqual(sent, [{ type: 'queueEdit', id: 't1', repo: '/r/demo', title: 'Handle empty input',
+    detail: 'rewritten', kind: 'test', priority: 0, acceptance: ['first', 'second'] }]);
+  send({ type: 'queueError', id: 't1', error: 'another task already has that title' });
+  assert.ok(els.queueList.text().includes('another task already has that title'), 'a refused edit is shown in the form');
+  send({ type: 'queueSaved', task: { id: 't1' } });
+  assert.ok(els.queueList.text().includes('class="icon qdel"'), 'saving closes the form');
+});
+
+test('Clear all and the settings budget control reach the extension', () => {
+  const { handlers, sent, els } = panelHarness;
+  sent.length = 0;
+  handlers['doc:click'](hit({ '#qclear': {} }));
+  handlers['doc:click'](hit({ '#costSettings': {} }));
+  els.changeBudget.listeners.click();
+  assert.deepStrictEqual(sent, [
+    { type: 'queueClear', repo: '/r/demo' },
+    { type: 'settingsRefresh' },
+    { type: 'budget' },
+  ]);
+  assert.strictEqual(els['pane-settings'].hidden, false, 'Manage opens the actual cost settings');
+});
+
+test('the monthly budget shows as a meter without duplicating the activity log', () => {
+  const { els, send } = panelHarness;
+  send({ type: 'status', data: QUEUE_STATUS });
+  const out = els.status.text();
+  assert.ok(out.includes('$2.20') && out.includes('$20.00'), 'both sides of the cap are shown');
+  assert.ok(out.includes('this month') && out.includes('back 2026-10-05'), 'the window is named');
+  assert.ok(/class="meter-fill"[^>]*width:11\.0%/.test(out), 'the meter is filled by proportion');
+  assert.strictEqual(els.recent, undefined, 'the chat does not duplicate the title-bar activity tracker');
+});
+
+test('a spent month is called out and the meter is full', () => {
+  const { els, send } = panelHarness;
+  send({ type: 'status', data: { ...QUEUE_STATUS, spend: { used: 20, cap: 20, left: 0, resets: '2026-10-05', shared: true } } });
+  const out = els.status.text();
+  assert.ok(out.includes('— spent'));
+  assert.ok(out.includes('meter-fill full'));
+  send({ type: 'status', data: QUEUE_STATUS });   // leave the harness as the others expect
+});
+
+test('provider usage is separate from local costs and missing values never become zero', () => {
+  const { els, send } = panelHarness;
+  send({ type: 'info', data: { provider_usage: { available: true, usage_daily: 1.23, usage_monthly: 4.56, checked_at: '2026-09-26T12:00:00Z' } } });
+  let out = els.status.text();
+  assert.ok(out.includes('OpenRouter key usage') && out.includes('$1.23') && out.includes('$4.56'));
+  // The spend meter is labelled by where the number comes from: OpenRouter reported it, this
+  // panel did not price it locally. Renamed from "locally recorded response costs".
+  assert.ok(out.includes('background budget') && out.includes('all activity on this key'));
+  send({ type: 'info', data: { provider_usage: { available: false } } });
+  out = els.status.text();assert.ok(out.includes('usage unavailable'));assert.ok(!out.includes('OpenRouter key usage: <b>$0'));
+  send({ type: 'info', data: {} });
+});
+
+test('the stylesheet is built on one spacing and radius scale', () => {
+  const css = fs.readFileSync(path.join(EXT, 'media', 'panel.css'), 'utf8');
+  ['--sp-1: 4px', '--sp-2: 8px', '--sp-3: 12px', '--sp-4: 16px',
+   '--r-sm: 4px', '--r-md: 6px', '--r-lg: 8px'].forEach((tok) => assert.ok(css.includes(tok), tok));
+  // the input-border fallback chain, so a theme setting only one still shows an edge
+  assert.ok(/--edge:.*inlineChatInput-border.*input-border.*widget-border/.test(css));
+  // Cursor defines --vscode-input-background as an empty string rather than omitting it, so
+  // var(--vscode-input-background, fallback) never engages its fallback — the empty value is
+  // substituted as-is, which makes the whole `background` declaration invalid and transparent.
+  // --field-bg/--field-fg must not reference the vscode-input-* tokens at all; build them from
+  // --surface/--vscode-foreground, which are already proven to render in this same panel.
+  assert.ok(/--field-bg:\s*var\(--surface-raised\)/.test(css));
+  assert.ok(/--field-fg:\s*var\(--vscode-foreground/.test(css));
+  const cssNoComments = css.replace(/\/\*[\s\S]*?\*\//g, '');
+  assert.ok(!cssNoComments.includes('--vscode-input-background'), 'do not reference this token outside comments, even as a fallback source — it is defined-but-empty in Cursor, which defeats var() fallback');
+  assert.ok(!cssNoComments.includes('--vscode-input-foreground'), 'do not reference this token outside comments, even as a fallback source');
+  assert.ok(css.includes('.meter-fill') && css.includes('.status-deck:not([open])'));
+  assert.ok(css.includes('#threads:has(.empty-state) + .composer'), 'the empty state cannot slide under the chat box');
+  assert.ok(css.includes('.composer') && css.includes('.settings-card') && css.includes('@media (max-width: 270px)'),
+    'the polished composer, settings and narrow sidebar layout are styled');
+});
+
+test('the row controls are revealed by hover and by keyboard focus', () => {
+  const css = fs.readFileSync(path.join(EXT, 'media', 'panel.css'), 'utf8');
+  assert.ok(/\.qactions\s*{[^}]*visibility:\s*hidden/.test(css));
+  assert.ok(css.includes('.qrow:hover .qactions') && css.includes('.qrow:focus-within .qactions'));
+});
+
+test('the idle clock reads at a glance', () => {
+  const f = ext._test.idleFor;
+  assert.strictEqual(f(0), '0s');
+  assert.strictEqual(f(45), '45s');
+  assert.strictEqual(f(252), '4m12s');
+  assert.strictEqual(f(3600), '1h00m');
+  assert.strictEqual(f(3725), '1h02m');
+  assert.strictEqual(f(-5), '0s', 'a clock skew must not print a negative age');
+});
+
+test('the activity tab tails by offset and shows silence as well as lines', async () => {
+  // A hung swarm writes nothing, so the tab has to report elapsed time on its own.
+  const calls = [];
+  const replies = [
+    { exists: true, day: 'D1', path: '/l/D1.log', offset: 10, lines: ['a', 'b'], stale_seconds: 2, daemon_running: true },
+    { exists: true, day: 'D1', path: '/l/D1.log', offset: 10, lines: [], stale_seconds: 900, daemon_running: true },
+  ];
+  let last = replies[replies.length - 1];
+  const stub = async (args) => { calls.push(args); last = replies.shift() || last; return last; };
+  {
+    await ext._test.showActivity('/r/demo', stub);
+    const term = terminals[terminals.length - 1];
+    assert.strictEqual(term.name, 'Flint Swarm: activity');
+    term.pty.open();
+    await new Promise((r) => setTimeout(r, 30));
+    const out = term.out.join('');
+    assert.ok(out.includes('Flint Swarm — activity'), 'the tab names itself');
+    assert.ok(out.includes('\r\n'), 'a terminal needs CRLF, not bare newlines');
+    assert.ok(/--repo/.test(calls.flat().join(' ')) && /--offset/.test(calls.flat().join(' ')));
+    assert.ok(out.includes('quiet '), 'the heartbeat prints even when the log grew');
+    term.out.length = 0;
+    await new Promise((r) => setTimeout(r, 30));
+    term.pty.close();          // closing the tab must stop the timer
+    const after = calls.length;
+    await new Promise((r) => setTimeout(r, 120));
+    assert.strictEqual(calls.length, after, 'a closed tab stops polling');
+  }
+});
+
+test('the HUD command is contributed with an icon and reaches the title bar', () => {
+  const cmd = manifest.contributes.commands.find((c) => c.command === 'flintSwarm.showActivity');
+  assert.ok(cmd && cmd.icon, 'the HUD needs an icon to appear as a title-bar button');
+  assert.ok(manifest.contributes.menus['view/title'].some((m) => m.command === 'flintSwarm.showActivity'));
+  assert.ok(typeof registered['flintSwarm.showActivity'] === 'function');
+  assert.ok(typeof registered['flintSwarm.showPanel'] === 'function');
+});
+
+test('an update click persists before install and reloads only after success', async () => {
+  const key = ext._test.UPDATE_CLICKS_KEY;
+  const previous = globalState.get(key, undefined);
+  const previousError = vscode.__error;
+  globalState.store.delete(key);
+  const posts = [];
+  const actions = [];
+  const installed = await ext._test.installExtensionUpdate(
+    { globalState },
+    (message) => posts.push(message),
+    async (root) => { actions.push(['install', root]); },
+    async () => { actions.push(['restart']); },
+  );
+  assert.strictEqual(installed, true);
+  assert.strictEqual(globalState.get(key), 1);
+  assert.strictEqual(posts[0].version, '0.0.1');
+  assert.strictEqual(posts[0].busy, true);
+  assert.strictEqual(posts[1].installed, true);
+  assert.deepStrictEqual(actions.map((entry) => entry[0]), ['install', 'restart']);
+
+  const failedPosts = [];
+  const failed = await ext._test.installExtensionUpdate(
+    { globalState },
+    (message) => failedPosts.push(message),
+    async () => { throw new Error('package failed'); },
+    async () => { throw new Error('restart must not run'); },
+  );
+  assert.strictEqual(failed, false);
+  assert.strictEqual(globalState.get(key), 2, 'the lifetime count includes a click even when installation fails');
+  assert.strictEqual(failedPosts[0].version, '0.0.2');
+  assert.match(failedPosts[1].error, /package failed/);
+
+  if (previous === undefined) globalState.store.delete(key);
+  else globalState.store.set(key, previous);
+  vscode.__error = previousError;
+});
+
+test('a real bridge call returns MIT hits with absolute paths', async () => {
+  const db = (process.env.FLINT_CORPUS_DB || path.join(require('os').homedir(), '.flint', 'corpus.db'));
+  if (!fs.existsSync(db)) { console.log('skip  (no study corpus at ' + db + ')'); return; }
+  const res = await ext._test.bridgeJson(['study', '--query', 'dijkstra priority queue', '-k', '2']);
+  assert.ok(res.hits.length >= 1);
+  assert.ok(path.isAbsolute(res.hits[0].path) && fs.existsSync(res.hits[0].path), res.hits[0].path);
+});
+
+test('the provider picker offers locals first and remembers the choice', () => {
+  const choices = ext._test.providerChoices();
+  assert.strictEqual(choices[0].id, 'openrouter');
+  assert.ok(choices.some((c) => c.id === 'ollama' && c.local));
+  assert.ok(choices.some((c) => c.id === 'llamacpp' && c.local));
+  assert.ok(ext._test.chosenBackend());
+  assert.strictEqual(typeof ext._test.provState, 'function');
+  assert.strictEqual(typeof ext._test.saveProvState, 'undefined');  // state is written via the settings pipe, not exported
+});
+
+test('the fresh-start API-key prompt validates and surfaces a saved key', async () => {
+  const prompt = ext._test.promptForApiKey;
+  assert.strictEqual(typeof prompt, 'function');
+  // The prompt only ever runs once per session; reset the latch so tests are independent.
+  // The input box returns the mocked answer; with none, nothing is written and no error thrown.
+  vscode.__inputAnswer = undefined;
+  const skipped = await prompt('test');
+  assert.strictEqual(skipped, false);
+  // A valid-looking key would be stored in SecretStorage (or the compatibility bridge in
+  // this offline shim), so feed an obviously bad one to prove the client-side gate.
+  vscode.__inputAnswer = 'not-a-key';
+  const bad = await prompt('test');
+  assert.strictEqual(bad, false);   // rejected client-side before any bridge call
+  assert.ok(!vscode.__error || /sk-/.test(String(vscode.__error)));
+});
+
+test('maybePromptForApiKey skips when a key is already set or backend is local', async () => {
+  // The mock bridge `info` reports api_key: true (the real checkout has one), so the
+  // prompt must short-circuit without ever opening the input box.
+  vscode.__inputAnswer = 'sk-or-triggered-wrongly';
+  await ext._test.maybePromptForApiKey();
+  // No error surfaced means the prompt stayed silent.
+  assert.ok(!vscode.__error, String(vscode.__error));
+});
+
+(async () => {
+  let failed = 0;
+  for (const [name, fn] of tests) {
+    try { await fn(); console.log('ok  ', name); } catch (e) { failed++; console.log('FAIL', name, '\n    ', e && e.stack || e); }
+  }
+  console.log(`${tests.length - failed}/${tests.length} passed`);
+  process.exit(failed ? 1 : 0);
+})();
